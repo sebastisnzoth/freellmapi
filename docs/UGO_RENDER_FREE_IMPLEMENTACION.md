@@ -148,3 +148,27 @@ next: R0.2
 - Render Free: https://render.com/docs/free
 
 **Resultado de esta entrega:** diagnóstico y plan de implementación guardados como propuesta de GitHub. Ningún servidor, bucket, credencial ni modelo se ha configurado; pruebas runtime pendientes.
+
+
+## 7. Checkpoint HU0/HU1 — auditoría de solo lectura, 18/10/2026
+
+**Fuentes conectadas comprobadas:**
+- UGO PR #515: `OPEN / DRAFT`, HEAD `b2ed42a99891d87806cd912e3ea72047b88a81ee`, base SHA `79311730801fad2b717c36ee552421ed5302272b`.
+- FreeLLMAPI PR #1: `OPEN / DRAFT`, HEAD `6e915b085e7045423f56930eb6e7c3b2c9f47907`, base SHA `47c3a451e88242a97d274777a29a4dbf289e3e17`.
+- Supabase UGO Arena TEST `tmossnqfwfwjrtzwcbmm`: `ACTIVE_HEALTHY`; esto no confirma cuota Storage disponible ni autoriza cambios.
+- Render: listado de servicios devolvió `null` (inconcluso); consultas previas no encontraron PostgreSQL ni Key Value. No se comprobó todavía la visibilidad del repositorio dentro de la UI Render.
+- FreeLLMAPI `docker/README.md`, SHA de blob `b74116664625dc6648c276caafcdf8820c520aae`: `FREEAPI_DB_BACKUP_URL` utiliza `GET` al iniciar para restaurar y `PUT` periódico para copiar snapshots cifrados, con token bearer opcional. El contrato HTTP de detalle y errores requiere inspección del código fuente.
+
+**Checklist de verificación:**
+- [x] Lectura de PR #515 y PR #1 con metadatos y SHA registrados (**AUDITED, no VERIFIED runtime**).
+- [x] Lectura del estado del proyecto Supabase TEST.
+- [x] Identificación documental de métodos `GET`/`PUT` del respaldo cifrado.
+- [ ] Inspeccionar código específico de backup/restore, Dockerfile/entrypoint y sus errores.
+- [ ] Verificar en Render el acceso efectivo al fork y restricciones actuales del plan Free.
+- [ ] Confirmar disponibilidad, aislamiento, cuotas y autenticación del almacén externo gratis.
+- [ ] Demostrar backup/restauración ante reinicio, corrupción, token inválido, concurrentes y pérdida de disco con evidencia.
+- [ ] HU2–HU5: no ejecutados; sin despliegue, sin llamadas reales de IA, sin cambios a producción.
+
+**Próxima unidad desbloqueada:** inspeccionar el código fuente del respaldo y especificar receptor privado `GET`/`PUT` de objetos cifrados (TLS, autenticación, atomicidad, integridad, versionado y retención). Las cuotas globales de Hive deben permanecer transaccionales fuera del SQLite efímero. Una copia periódica no implica RPO cero y una restauración obsoleta no debe reactivar credenciales revocadas.
+
+**Estado:** HU0/HU1 = IN_PROGRESS (auditoría documental parcial); persistencia = UNVERIFIED / BLOCKED_EXTERNAL hasta comprobar receptor y restauración real.
