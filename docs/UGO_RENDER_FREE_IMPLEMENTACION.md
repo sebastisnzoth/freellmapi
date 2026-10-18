@@ -172,3 +172,66 @@ next: R0.2
 **Próxima unidad desbloqueada:** inspeccionar el código fuente del respaldo y especificar receptor privado `GET`/`PUT` de objetos cifrados (TLS, autenticación, atomicidad, integridad, versionado y retención). Las cuotas globales de Hive deben permanecer transaccionales fuera del SQLite efímero. Una copia periódica no implica RPO cero y una restauración obsoleta no debe reactivar credenciales revocadas.
 
 **Estado:** HU0/HU1 = IN_PROGRESS (auditoría documental parcial); persistencia = UNVERIFIED / BLOCKED_EXTERNAL hasta comprobar receptor y restauración real.
+
+## 6. Implementación local autorizada — checkpoint 18/10/2026
+
+La orden actual autoriza código en rama aislada y ensayos locales; prevalece sobre el permiso meramente documental anterior. No habilita creación de servicios, migraciones remotas, secretos, deploys, merge ni inferencia.
+
+Fuente conservada PR #1: `83617bcaae874c656124e5b5c82c83ee5ff67001`; main `47c3a451e88242a97d274777a29a4dbf289e3e17`. Rama local `work/hive-persistence`; código `2cebd76a61957c4b6fd94495e15f3850b631fb52`. [PR #1](https://github.com/sebastisnzoth/freellmapi/pull/1) permanece abierto/draft, sin actualizar. UGO conserva [PR #515](https://github.com/sebastisnzoth/ugo-admin-panel/pull/515); código local `94c589b8d48a9b8c551a44526f1f12a36241c901`. Los commits no se publicaron: se detectaron hooks de previews Vercel/Netlify en el PR #515. El paquete entregado contiene bundles/patches/evidencia; no fingir links remotos a commits locales.
+
+### Implementación concreta
+
+- `server/src/lib/db-backup.ts`: conserva AES256GCM/GZIP y las claves existentes. Sustituye checkpoint best-effort+copia del fichero por `VACUUM INTO`, con WAL consistente y archivo temporal privado; limita envelope 8 MiB/restore 64 MiB y comprueba GCM, cabecera y quick_check. Instala atómicamente sin sobrescribir un archivo creado concurrentemente. Un placeholder SQLite vacío exige recuperar en una ruta nueva.
+- Modo `FREEAPI_DB_BACKUP_STRICT=true`: HTTPS+bearer, no redirects, ETag obligatorio; GET404/204/200vacío falla cerrado. El ETag confirmado se guarda owner-only en sidecar vinculado a URL+ruta y se recupera tras reinicio. Nunca obtener un ETag nuevo para bendecir un SQLite viejo. Conflictos412 requieren reconciliar; un backup viejo no puede reponer cuotas globales porque éstas viven en PostgreSQL TEST.
+- Receptor en UGO `supabase/functions/ugo-hive-backup-receiver`: GET/PUT compatible, bucket nuevo privado `hive-freeapi-backups` (NO creado), objetos cifrados inmutables, SHA256, metadata/puntero CAS,3 versiones y cola de limpieza durable. Un commit con etapa vencida se rechaza. GC y commit comparten advisory lock, tiempo real `clock_timestamp` y READ COMMITTED. Cola pendiente máxima32; limpieza1 hora de gracia; GET exige frescura≤24 horas. Las copias completas incluyen cuentas/sesiones: no confundir con el exportador lógico de backups de la UI.
+- `deploy/render.hive-test.yaml`: validó el esquema actual de Render; Free, Docker, PORT10000/HOST0.0.0.0, healthcheck/api/ping, auto-deploy/previews off,1 instancia, sin disco/base/addons. No sincronizado; necesita fijar el SHA publicado antes del deploy específico y comprobar cuenta/cuotas/cero cargos.
+- `server/src/middleware/hiveLockdown.ts`: modo opt-in del manifest; sólo healthcheck público mínimo. Las otras rutas requieren token y aun autenticadas devuelven HIVE_INFERENCE_NOT_ENABLED. No hay flag de habilitación de inferencia.
+
+### Evidencia y reproducción
+
+En este repo:
+
+```bash
+npm ci
+npm run build
+npm run lint
+npm run test -w server -- src/__tests__/lib/db-backup.test.ts src/__tests__/lib/db-backup-http.test.ts src/__tests__/routes/hive-lockdown.test.ts src/__tests__/db/migrate/roundtrip.test.ts
+```
+
+Resultado acotado:19 aprobadas y1 omisión de plataforma; build y lint aprobaron. En el checkout UGO construido con este repo hermano:
+
+```bash
+FREEAPI_CHECKOUT=../freellmapi node scripts/hive-backup-local-integration.mjs
+```
+
+La prueba usa HTTPS real de loopback con CA efímera confiable, cliente FreeAPI compilado, receptor real, PostgreSQL embebido y archivos temporales. Recupera2 filas tras eliminar SQLite y reabrir receptor/PostgreSQL; otro proceso nuevo continúa usando sidecar. Verifica rechazo401, versión obsoleta412, corrupción502, una sola copia concurrente y recuperación de limpieza fallida. No usa Storage remoto ni modelos. RTO local medido≈decenas de milisegundos, no extrapolable a Render/cold start. RPO operativo propuesto5min sólo si las subidas terminan bien; nunca RPO cero.
+
+Revisión independiente de código realizada, con correcciones de strict restart, empty200, ETags no estrictos y GC. No sustituye Judge/Sentinel de runtime. La suite completa fue rechazada automáticamente cuando intentó conexión a api.test.com por SOCKS; no se reintentó. Docker/Node20-22 en contenedor, memoria512MiB, concurrencia multi-sesión real, Storage remoto, cold start y factura siguen sin verificar.
+
+### Gates y seguridad pendientes
+
+Render docs actuales leídas: https://render.com/docs/free.md y https://render.com/docs/blueprint-spec.md; schema https://render.com/schema/render.yaml.json. Free web se suspende tras15min y puede tardar≈1min en volver;750 horas mensuales compartidas, filesystem efímero. Excesos de banda/build con método de pago pueden facturarse: disponibilidad genérica Free no acredita presupuesto de la cuenta. El listado de servicios `null` no acredita que el workspace esté vacío. No se confirmó acceso efectivo del servicio al fork, tarjeta, saldo ni consumo.
+
+No reutilizar buckets KYC/documentos/evidencias TEST para este dominio. Tras permiso: crear bucket privado dedicado con máximo 8 MiB, instalar receptor y migración revisados, configurar token sólo receptor/Render; `service_role` permanece únicamente en Edge. Provisionar snapshot cifrado conocido con stage+CAS esperadoNULL; probar restauración real antes de arrancar Render estricto. No se creó endpoint público de bootstrap ni force.
+
+Claves separadas: `ENCRYPTION_KEY` cifra claves internas y requiere recifrado con el script existente al rotar; `FREEAPI_DB_BACKUP_KEY` cifra envelope y requiere reemitir copia/verificar restore; token autentica HTTP y puede revocarse sin descifrar. Pausar inferencia durante rotación, probar token viejo401 y nuevo válido, no loguear valores. Copias antiguas no deben reactivar credenciales/sesiones revocadas; revisar frescura y autoridad externa antes de recuperación manual. Conservar copias cifradas y claves anteriores sólo según retención aprobada.
+
+**Bloqueo adicional UGO:** un modelID FreeAPI puede resolver a varios proveedores y fallar hacia otros. La política UGO rechaza FreeAPI por completo hasta contrato ejecutable de proveedor/modelo/endpoint fijo, sin fallback interno y con evidencia del proveedor servido. Ningún booleano de configuración levanta este bloqueo. No hubo llamada a OpenRouter, FreeAPI externo, misión ni worker.
+
+`TASK_ID | STATUS | REPO | BRANCH | SOURCE_SHA | RESULT_SHA | TESTS | RUN_ID | EVIDENCE | JUDGE | SENTINEL | COST | BLOCKER | NEXT_TASK`
+
+`HU1-LOCAL | IN_PROGRESS | freellmapi | work/hive-persistence | 83617bc… | 2cebd76… | 19PASS/1SKIP+HTTPS local | local-HIVE-20261018 | tests+paquete entregado | code-review independiente | runtime no ejecutado | 0 recursos/0 llamadasmodelo | Storage remoto no probado | aprobación de publicación/ensayo`
+
+`HU2-PREP | IN_PROGRESS | freellmapi | work/hive-persistence | 83617bc… | 2cebd76… | schema/build/lint | local-HIVE-20261018 | deploy/render.hive-test.yaml | code-review | runtime no ejecutado | 0 servicios | cuenta/Docker/SHA/deploy no verificados | fijar revisión y solicitar lote TEST`
+
+**No VERIFIED global.** Recursos externos modificados: ninguno. Siguiente autorización inmediata: publicación de PRs considerando hooks de previews; no incluye merge/producción/EmpresaON. La creación posterior de bucket/receptor/migración/secretos/Render y la inferencia requieren su propia aprobación concreta y presupuesto US$0 comprobado. Rollback: mantener lockdown, revocar token/suspender sólo servicio TEST creado, conservar backups/evidencia; no restaurar cuotas desde SQLite ni borrar buckets/tablas sin permiso.
+
+Evidencia local persistida: `docs/ugo-hive-evidence/results.json`, logs, revisión independiente y hash del schema. La revisión final no encontró bloqueos concretos restantes para la preparación; no certifica despliegue. La última prueba HTTPS local midió42ms de restore, sin valor predictivo para Render.
+
+### Autorización persistente — 18/10/2026 18:49 BRT
+
+El usuario autorizó actualizar los PR y previews TEST si el cambio está verificado, sin regresiones detectadas y con costo US$0 comprobado. Mantener siempre resultados, límites y evidencia documentados. No requiere repetir esa autorización; no incluye merge, producción, recursos Render, secretos, migraciones remotas ni habilitar inferencia. Se actualizó la descripción remota de PR1 yPR515 con ese permiso y los resultados locales; sus HEAD permanecen83617bc/b2ed42a. Netlify reporta Free, pero Vercel no acredita plan/billing en la información disponible: no se hicieron push/previews. Siguiente paso condicionado a verificar costo cero o supresión efectiva de builds, sin pagos ni cambios de producción.
+
+### Canal web vigente — 18/10/2026 18:53 BRT
+
+El usuario informó Vercel pausado y descartó Netlify; único destino web: GitHub Pages. Se omiten previews Netlify de PR1/PR515 mediante marcador de título. Se desbloquea el push a sus ramas de desarrollo y CI exact-SHA, sin merge/main ni recursos/deploys remotos. GitHub Pages sólo sirve frontend estático; no ejecuta FreeAPI/SQLite/workers ni Edge Functions. Render conserva el carácter de backend preparado pero NO autorizado para crear/desplegar. La inferencia sigue bloqueada y el presupuestoUS$0.

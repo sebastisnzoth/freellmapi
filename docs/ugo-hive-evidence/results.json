@@ -1,0 +1,44 @@
+{
+  "observed_at_utc": "2026-10-18T21:46:18.511731+00:00",
+  "run_id": "local-HIVE-20261018",
+  "ugo_code_sha": "94c589b8d48a9b8c551a44526f1f12a36241c901",
+  "freeapi_code_sha": "2cebd76a61957c4b6fd94495e15f3850b631fb52",
+  "ugo_tests": {
+    "passed": 1438,
+    "skipped": 8,
+    "failed": 0
+  },
+  "hive_focused_including_original_contracts": {
+    "passed": 18,
+    "failed": 0
+  },
+  "freeapi_focused_and_migration_roundtrip": {
+    "passed": 19,
+    "skipped": 1,
+    "failed": 0
+  },
+  "ugo_build": "PASS",
+  "freeapi_build": "PASS",
+  "deno_check": "PASS",
+  "ugo_lint": {
+    "errors": 0,
+    "warnings": 978,
+    "same_warnings_as_initial_run": true
+  },
+  "freeapi_lint": "PASS",
+  "render_schema": "PASS",
+  "docker_build": "NOT_RUN",
+  "local_https_interop": "PASS",
+  "independent_prepared_code_review": "NO_REMAINING_CONCRETE_BLOCKERS",
+  "remote_storage": "NOT_RUN",
+  "postgres_multisession_stress": "NOT_RUN",
+  "render_service": "NOT_CREATED",
+  "real_inference": "NOT_RUN",
+  "full_freeapi_suite": "BLOCKED_AUTO_REVIEW_EXTERNAL_API_TEST_COM_VIA_SOCKS",
+  "new_external_resources": [],
+  "new_model_calls": 0,
+  "account_billing": "NOT_AUDITED",
+  "production_modified": false,
+  "runtime_judge": "NOT_RUN",
+  "runtime_sentinel": "NOT_DEPLOYED;READ_ONLY_QUERY_PERFORMED"
+}

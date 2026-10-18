@@ -1,0 +1,4 @@
+PASS: JSON Schema draft2020-12, plan=free, previews=off, autoDeployTrigger=off, no disk/database/addons
+Schema URL: https://render.com/schema/render.yaml.json
+Schema SHA256: 8a3fb8da6b4f55fe686fbefa790e011d3dd7895f013f355953c572a21ab6494a
+Docker container build: NOT_RUN (docker executable unavailable)

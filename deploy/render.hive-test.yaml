@@ -1,0 +1,44 @@
+# Preparation only. Do not sync/create without explicit approval and account billing check.
+previews:
+  generation: 'off'
+services:
+  - type: web
+    name: ugo-freeapi-test
+    runtime: docker
+    plan: free
+    branch: docs/ugo-render-free-deployment-plan-20261018
+    repo: https://github.com/sebastisnzoth/freellmapi
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: 'off'
+    healthCheckPath: /api/ping
+    numInstances: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: '10000'
+      - key: FREEAPI_DB_PATH
+        value: /app/server/data/freeapi.db
+      - key: FREEAPI_DB_BACKUP_STRICT
+        value: 'true'
+      - key: FREEAPI_DB_BACKUP_INTERVAL_MS
+        value: '300000'
+      - key: FREEAPI_HIVE_LOCKDOWN
+        value: 'true'
+      - key: REQUEST_BODY_LIMIT_MB
+        value: '1'
+      - key: PROXY_RATE_LIMIT_RPM
+        value: '5'
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: FREEAPI_DB_BACKUP_KEY
+        sync: false
+      - key: FREEAPI_DB_BACKUP_TOKEN
+        sync: false
+      - key: FREEAPI_DB_BACKUP_URL
+        sync: false
+      - key: FREEAPI_HIVE_TOKEN
+        sync: false
