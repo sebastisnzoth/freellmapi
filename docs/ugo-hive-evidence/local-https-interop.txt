@@ -1,0 +1,5 @@
+[db-backup] uploaded 8192 bytes
+[db-backup] restored 8192 bytes
+[db-backup] uploaded 8192 bytes
+[db-backup] restored 8192 bytes
+{"result":"PASS","transport":"real loopback HTTPS with trusted ephemeral CA","sqlite_rows_after_process_store_restart":2,"concurrent_backups_success":1,"unauthorized":401,"stale":412,"corrupt":502,"restore_ms":42,"total_ms":2399,"acknowledged_sidecar_new_os_process":true,"cleanup_failure_then_recovery":true,"remote_storage_verified":false,"external_model_calls":0}

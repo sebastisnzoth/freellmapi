@@ -1,16 +1,72 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { gzipSync, gunzipSync } from 'zlib';
 import type { Db } from '../db/types.js';
 import type { Scheduler } from './scheduler.js';
-import { getDefaultDbPath } from '../db/index.js';
+import { getDefaultDbPath, defaultDbFactory } from '../db/index.js';
 import { restrictToOwner } from './file-permissions.js';
 
 const MAGIC = Buffer.from('FAPIBK1\0');
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 30 * 1000;
 const PLACEHOLDER_KEY = 'replace-with-64-char-hex';
+const MAX_BACKUP_BYTES = 8 * 1024 * 1024;
+const MAX_DATABASE_BYTES = 64 * 1024 * 1024;
+const remoteVersions = new Map<string, string>();
+const activeBackups = new Set<string>();
+const strictRemote = () => process.env.FREEAPI_DB_BACKUP_STRICT === 'true';
+
+const versionKey = (target: string, dbPath: string) => target + '\0' + path.resolve(dbPath);
+const versionPath = (dbPath: string) => dbPath + '.backup-version.json';
+function rememberVersion(target: string, dbPath: string, etag: string) {
+  remoteVersions.set(versionKey(target, dbPath), etag);
+  if (!strictRemote()) return;
+  const temporary = versionPath(dbPath) + '.' + crypto.randomUUID();
+  try {
+    fs.writeFileSync(temporary, JSON.stringify({ target, etag }), { mode: 0o600, flag: 'wx' });
+    fs.renameSync(temporary, versionPath(dbPath));
+    restrictToOwner(versionPath(dbPath));
+  } finally { fs.rmSync(temporary, { force: true }); }
+}
+function acknowledgedVersion(target: string, dbPath: string): string | undefined {
+  const key = versionKey(target, dbPath);
+  const inMemory = remoteVersions.get(key);
+  if (inMemory) return inMemory;
+  if (!strictRemote()) return undefined;
+  try {
+    const saved = JSON.parse(fs.readFileSync(versionPath(dbPath), 'utf8')) as { target: string; etag: string };
+    if (saved.target !== target || !/^"[0-9a-f-]{36}"$/.test(saved.etag)) throw new Error('invalid version');
+    remoteVersions.set(key, saved.etag);
+    return saved.etag;
+  } catch { throw new Error('strict backup requires acknowledged local version metadata; restore into an empty database path'); }
+}
+
+function checkRemote(target: string) {
+  const url = new URL(target);
+  if (strictRemote() && (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash ||
+      !process.env.FREEAPI_DB_BACKUP_TOKEN?.trim())) {
+    throw new Error('strict backup requires HTTPS, bearer token and a URL without credentials/query/fragment');
+  }
+}
+
+async function boundedBody(res: Response): Promise<Buffer> {
+  const reader = res.body?.getReader();
+  if (!reader) return Buffer.alloc(0);
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_BACKUP_BYTES) throw new Error('backup exceeds size limit');
+      chunks.push(Buffer.from(value));
+    }
+  } finally { await reader.cancel(); }
+  return Buffer.concat(chunks);
+}
 
 export interface DbBackupResult {
   ok: boolean;
@@ -160,15 +216,22 @@ function decodeHuggingFacePayload(raw: Buffer): Buffer {
   return Buffer.from(raw.toString('utf8'), 'base64');
 }
 
-async function readTarget(target: string): Promise<Buffer | null> {
+async function readTarget(target: string, dbPath: string): Promise<Buffer | null> {
   if (isHttpTarget(target)) {
+    checkRemote(target);
     const headers: Record<string, string> = {};
     const token = process.env.FREEAPI_DB_BACKUP_TOKEN?.trim();
     if (token) headers.Authorization = `Bearer ${token}`;
-    const res = await fetch(target, { method: 'GET', headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-    if (res.status === 404 || res.status === 204) return null;
+    const res = await fetch(target, { method: 'GET', headers, redirect: 'error', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    if (res.status === 404 || res.status === 204) {
+      if (strictRemote()) throw new Error('strict backup requires an existing provisioned snapshot');
+      return null;
+    }
     if (!res.ok) throw new Error(`backup restore failed: HTTP ${res.status}`);
-    const raw = Buffer.from(await res.arrayBuffer());
+    const raw = await boundedBody(res);
+    const etag = res.headers.get('etag');
+    if (strictRemote() && !/^"[0-9a-f-]{36}"$/.test(etag || '')) throw new Error('backup ETag required');
+    if (etag) remoteVersions.set(versionKey(target, dbPath), etag);
     return parseHuggingFaceTarget(target) ? decodeHuggingFacePayload(raw) : raw;
   }
 
@@ -176,8 +239,10 @@ async function readTarget(target: string): Promise<Buffer | null> {
   return fs.readFileSync(target);
 }
 
-async function writeTarget(target: string, payload: Buffer): Promise<void> {
+async function writeTarget(target: string, payload: Buffer, dbPath: string): Promise<void> {
+  if (payload.length > MAX_BACKUP_BYTES) throw new Error('backup exceeds size limit');
   if (isHttpTarget(target)) {
+    checkRemote(target);
     const token = process.env.FREEAPI_DB_BACKUP_TOKEN?.trim();
     const huggingFace = parseHuggingFaceTarget(target);
     if (huggingFace) {
@@ -190,13 +255,24 @@ async function writeTarget(target: string, payload: Buffer): Promise<void> {
 
     const headers: Record<string, string> = { 'Content-Type': 'application/octet-stream' };
     if (token) headers.Authorization = `Bearer ${token}`;
+    const acknowledged = acknowledgedVersion(target, dbPath);
+    if (acknowledged) headers['If-Match'] = acknowledged;
+    if (strictRemote()) {
+      const version = acknowledged;
+      if (!version) throw new Error('restore current snapshot before uploading in strict mode');
+      headers['If-Match'] = version;
+    }
     const res = await fetch(target, {
       method: 'PUT',
+      redirect: 'error',
       headers,
       body: payload,
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`backup upload failed: HTTP ${res.status}`);
+    const etag = res.headers.get('etag');
+    if (strictRemote() && !/^"[0-9a-f-]{36}"$/.test(etag || '')) throw new Error('backup upload ETag required');
+    if (etag) rememberVersion(target, dbPath, etag);
     return;
   }
 
@@ -216,28 +292,48 @@ export async function restoreDbBackupIfNeeded(dbPath = getDefaultDbPath()): Prom
   const target = backupTarget();
   if (!target) return { ok: true, skipped: 'not configured' };
   if (dbPath === ':memory:') return { ok: true, target, skipped: 'memory database' };
-  if (fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0) return { ok: true, target, skipped: 'database already exists' };
+  if (fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0) {
+    if (strictRemote()) { checkRemote(target); acknowledgedVersion(target, dbPath); }
+    return { ok: true, target, skipped: 'database already exists' };
+  }
 
-  const payload = await readTarget(target);
-  if (!payload || payload.length === 0) return { ok: true, target, skipped: 'no backup found' };
+  if (fs.existsSync(dbPath)) throw new Error('EMPTY_DATABASE_PLACEHOLDER_REQUIRES_RECOVERY: use a new empty path; no existing file is overwritten');
+  const payload = await readTarget(target, dbPath);
+  if (!payload || payload.length === 0) {
+    if (strictRemote()) throw new Error('strict backup refuses an empty remote snapshot');
+    return { ok: true, target, skipped: 'no backup found' };
+  }
 
   let restored: Buffer;
   try {
-    restored = gunzipSync(decryptBackup(payload));
+    restored = gunzipSync(decryptBackup(payload), { maxOutputLength: MAX_DATABASE_BYTES });
+    if (!restored.subarray(0, 16).equals(Buffer.from('SQLite format 3\0'))) throw new Error('invalid SQLite header');
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    throw new Error(`could not restore SQLite backup from ${target}: ${detail}`);
+    throw new Error(`could not restore SQLite backup: ${detail}`);
   }
 
   fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
   // This is the decrypted database — provider keys and the dashboard password
   // hash in the clear. connectDb hardens it too, but that is a later call and
   // sometimes a later process; the file must not be readable in between.
-  fs.writeFileSync(dbPath, restored, { mode: 0o600 });
+  const temporary = dbPath + '.' + crypto.randomUUID() + '.restore';
+  try {
+    fs.writeFileSync(temporary, restored, { mode: 0o600, flag: 'wx' });
+    const candidate = defaultDbFactory()(temporary);
+    try {
+      const checked = candidate.pragma('quick_check') as { quick_check: string }[];
+      if (checked.length !== 1 || checked[0].quick_check !== 'ok') throw new Error('SQLite integrity check failed');
+    } finally { candidate.close?.(); }
+    // link is atomic and refuses to replace a database created concurrently.
+    fs.linkSync(temporary, dbPath);
+  } finally { fs.rmSync(temporary, { force: true }); }
   if (!restrictToOwner(dbPath)) {
     console.warn(`[db-backup] could not restrict permissions on the restored database at ${dbPath}`);
   }
-  console.log(`[db-backup] restored ${restored.length} bytes from ${target}`);
+  const etag = remoteVersions.get(versionKey(target, dbPath));
+  if (etag) rememberVersion(target, dbPath, etag);
+  console.log(`[db-backup] restored ${restored.length} bytes`);
   return { ok: true, target, bytes: restored.length, restored: true };
 }
 
@@ -247,17 +343,24 @@ export async function backupDbNow(db: Db, dbPath = getDefaultDbPath()): Promise<
   if (dbPath === ':memory:') return { ok: true, target, skipped: 'memory database' };
   if (!fs.existsSync(dbPath)) return { ok: false, target, skipped: 'database file missing' };
 
+  if (activeBackups.has(target)) throw new Error('backup already in progress');
+  activeBackups.add(target);
+  let dir: string | undefined;
   try {
-    db.pragma('wal_checkpoint(TRUNCATE)');
-  } catch {
-    // Best effort: reading the main DB still works for rollback-journal or quiet WAL DBs.
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-snapshot-'));
+    fs.chmodSync(dir, 0o700);
+    const snapshot = path.join(dir, 'snapshot.db');
+    // SQLite itself snapshots committed WAL pages; no best-effort checkpoint/file copy.
+    db.prepare('VACUUM INTO ?').run(snapshot);
+    const plain = fs.readFileSync(snapshot);
+    if (plain.length > MAX_DATABASE_BYTES) throw new Error('database exceeds backup size limit');
+    await writeTarget(target, encryptBackup(gzipSync(plain)), dbPath);
+    console.log(`[db-backup] uploaded ${plain.length} bytes`);
+    return { ok: true, target, bytes: plain.length };
+  } finally {
+    activeBackups.delete(target);
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
   }
-
-  const plain = fs.readFileSync(dbPath);
-  const payload = encryptBackup(gzipSync(plain));
-  await writeTarget(target, payload);
-  console.log(`[db-backup] uploaded ${plain.length} bytes to ${target}`);
-  return { ok: true, target, bytes: plain.length };
 }
 
 export function startDbBackupPump(db: Db, scheduler: Scheduler, dbPath = getDefaultDbPath()): (() => void) | null {

@@ -1,0 +1,94 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> @freellmapi/server@0.2.1 test
+> vitest run --pool=forks --fileParallelism=false src/__tests__/lib/db-backup.test.ts src/__tests__/lib/db-backup-http.test.ts src/__tests__/routes/hive-lockdown.test.ts src/__tests__/db/migrate/roundtrip.test.ts
+
+
+ RUN  v3.2.7 /workspace/scratch/8079b329e974/freellmapi/server
+
+stdout | src/__tests__/lib/db-backup.test.ts > encrypted SQLite backup > backs up and restores a SQLite file from a configured path
+[db-backup] uploaded 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > encrypted SQLite backup > backs up and restores a SQLite file from a configured path
+[db-backup] restored 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > backup file permissions > writes the backup blob owner-only
+[db-backup] uploaded 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > backup file permissions > tightens a backup target that already existed
+[db-backup] uploaded 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > backup file permissions > writes the restored database owner-only
+[db-backup] uploaded 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > backup file permissions > writes the restored database owner-only
+[db-backup] restored 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > Hugging Face backup target > uploads through the commit API as base64 and restores it
+[db-backup] uploaded 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > Hugging Face backup target > uploads through the commit API as base64 and restores it
+[db-backup] restored 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > Hugging Face backup target > still restores a blob that was stored raw
+[db-backup] uploaded 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > Hugging Face backup target > still restores a blob that was stored raw
+[db-backup] restored 8192 bytes
+
+stdout | src/__tests__/lib/db-backup.test.ts > Hugging Face backup target > leaves a plain HTTP target on the PUT path
+[db-backup] uploaded 8192 bytes
+
+ ✓ src/__tests__/lib/db-backup.test.ts (14 tests | 1 skipped) 77ms
+stdout | src/__tests__/db/migrate/roundtrip.test.ts > migration round trip > connectDb opens a connection without applying migrations
+Database initialized at :memory:
+
+stdout | src/__tests__/db/migrate/roundtrip.test.ts > migration round trip > runs the legacy baseline against existing legacy DBs so rebased legacy changes apply
+Seeded 25 models and fallback config
+
+  A unified API key was generated. Open the dashboard and retrieve it from the Keys page.
+  The key is intentionally not printed to logs.
+
+Created Default profile
+
+stderr | src/__tests__/db/migrate/roundtrip.test.ts > migration round trip > runs the legacy baseline against existing legacy DBs so rebased legacy changes apply
+[crypto] No ENCRYPTION_KEY set — generated an in-memory dev key. Set ENCRYPTION_KEY for production.
+
+stderr | src/__tests__/db/migrate/roundtrip.test.ts > migration round trip > runs the legacy baseline against existing legacy DBs so rebased legacy changes apply
+[crypto] No ENCRYPTION_KEY set — using an auto-generated in-memory key (dev only).
+
+stdout | src/__tests__/db/migrate/roundtrip.test.ts > migration round trip > runs all migrations up, down to baseline, then up to the same schema
+Seeded 25 models and fallback config
+
+  A unified API key was generated. Open the dashboard and retrieve it from the Keys page.
+  The key is intentionally not printed to logs.
+
+Created Default profile
+
+stderr | src/__tests__/db/migrate/roundtrip.test.ts > migration round trip > runs all migrations up, down to baseline, then up to the same schema
+[crypto] No ENCRYPTION_KEY set — generated an in-memory dev key. Set ENCRYPTION_KEY for production.
+
+ ✓ src/__tests__/db/migrate/roundtrip.test.ts (3 tests) 259ms
+stdout | src/__tests__/lib/db-backup-http.test.ts > real encrypted HTTP backup recovery > survives local file deletion and receiver restart; includes committed WAL with an active reader
+[db-backup] uploaded 8192 bytes
+
+stdout | src/__tests__/lib/db-backup-http.test.ts > real encrypted HTTP backup recovery > survives local file deletion and receiver restart; includes committed WAL with an active reader
+[db-backup] restored 8192 bytes
+
+stdout | src/__tests__/lib/db-backup-http.test.ts > real encrypted HTTP backup recovery > survives local file deletion and receiver restart; includes committed WAL with an active reader
+[db-backup] uploaded 8192 bytes
+
+stdout | src/__tests__/lib/db-backup-http.test.ts > real encrypted HTTP backup recovery > survives local file deletion and receiver restart; includes committed WAL with an active reader
+[db-backup] uploaded 8192 bytes
+
+stdout | src/__tests__/lib/db-backup-http.test.ts > real encrypted HTTP backup recovery > survives local file deletion and receiver restart; includes committed WAL with an active reader
+[db-backup] restored 8192 bytes
+
+ ✓ src/__tests__/lib/db-backup-http.test.ts (2 tests) 120ms
+ ✓ src/__tests__/routes/hive-lockdown.test.ts (1 test) 67ms
+
+ Test Files  4 passed (4)
+      Tests  19 passed | 1 skipped (20)
+   Start at  06:37:30
+   Duration  1.90s (transform 323ms, setup 0ms, collect 605ms, tests 522ms, environment 1ms, prepare 243ms)
+

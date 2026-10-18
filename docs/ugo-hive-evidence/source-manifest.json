@@ -1,0 +1,27 @@
+{
+  "ugo_source_sha": "94c589b8d48a9b8c551a44526f1f12a36241c901",
+  "freeapi_source_sha": "2cebd76a61957c4b6fd94495e15f3850b631fb52",
+  "external_resources_modified": [],
+  "inference_enabled": false,
+  "production_modified": false,
+  "files": {
+    "ugo-admin-panel/package-lock.json": "0f016fad53316b010c36e1f07cafdf1cb274d32ee97973df354371fde24ab161",
+    "ugo-admin-panel/package.json": "5ce091b64e7c5c6ee1bf89760dd1af2c1fce3d192f440ecb6391d1ed5f8501b0",
+    "ugo-admin-panel/scripts/hive-backup-local-integration.mjs": "c096c2a15721732c1a4561897d5242618bd22332f09afa618084539b5774fdfa",
+    "ugo-admin-panel/supabase/functions/ugo-hive-backup-receiver/config.toml": "149dc8727e036c5dd9a6e078cd9c93e54f6ae8c445eb92721fd379f67d221868",
+    "ugo-admin-panel/supabase/functions/ugo-hive-backup-receiver/handler.mjs": "1fb692a07f2d9b9cbb16f6dce7ebcc494b55d8a3a5423671282300f5c1c36bd9",
+    "ugo-admin-panel/supabase/functions/ugo-hive-backup-receiver/index.ts": "d90cf39c1ecb88203a56d41ad7047c3a5ff1a85c7fbbf651fb21b13227cfd400",
+    "ugo-admin-panel/supabase/functions/ugo-hive-model-router/index.ts": "3fa9f17cbaa0917223ddf05f2f316f81dd11905fdae5b45173a790e12c079d74",
+    "ugo-admin-panel/supabase/functions/ugo-hive-model-router/policy.mjs": "12058c1d1a663207867f68592fbe3c554b0b8da9c8fbcdaa84951aaa6e8c88df",
+    "ugo-admin-panel/supabase/migrations/20261018212409_hive_test_quota_and_backup_cas.sql": "f0d78ef8209622e4a61a19f58d07c34296aeb972e23b0e6cc96e760718d849bb",
+    "ugo-admin-panel/tests/hive/database.test.mjs": "46297b1b1fb78a77a4e7b10935d5ebf99899b8061d3d5af43823ea26252323b5",
+    "ugo-admin-panel/tests/hive/policy.test.mjs": "47f56c429e76944706eeb0c2dbbfe5c6b48d74c70506b8ed87c67d8fcce1bdd8",
+    "ugo-admin-panel/tests/hive/receiver.test.mjs": "0b3913f4e3dab0f580c12ca9f72ba431d1c48c7dda5e33f44eebf3fd78981440",
+    "freellmapi/deploy/render.hive-test.yaml": "14ba8747cd4c7d23a4ed4905ba57e63347b492c859945061f3fbcde5f49ed6e1",
+    "freellmapi/server/src/__tests__/lib/db-backup-http.test.ts": "7153b527f1fda7e5481843f105093a8cb6bc317a3f9121cb6d28fa86c868da5a",
+    "freellmapi/server/src/__tests__/routes/hive-lockdown.test.ts": "5e3eb06430b0280a7b5e6a3f55a3b939696f1d33423e2ac720a6838525539bd7",
+    "freellmapi/server/src/app.ts": "875c54cfccff72cea03255849150503dfcd15fc3023e75f16e9c2aecd9a28688",
+    "freellmapi/server/src/lib/db-backup.ts": "555b6c958fff036563c3f1dac90fe540fa64e62fce16cd852ceb801df046d8ad",
+    "freellmapi/server/src/middleware/hiveLockdown.ts": "1b19f6cc4626909d48cc6291c592283a3a9ddd5617e84fc23b7c7aa665722fcc"
+  }
+}

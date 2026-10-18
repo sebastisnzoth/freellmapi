@@ -1,4 +1,5 @@
 import express from 'express';
+import { hiveLockdown } from './middleware/hiveLockdown.js';
 import compression from 'compression';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -96,6 +97,7 @@ function isTrustworthyOrigin(req: express.Request): boolean {
 export function createApp(config?: Config) {
   const cfg = config ?? loadConfig();
   const app = express();
+  app.use(hiveLockdown);
   // TRUST_PROXY (#1024): opt-in trust of X-Forwarded-* from a reverse proxy.
   // false (default) ignores forwarded headers so direct callers cannot spoof
   // the client IP; true trusts every hop; a comma-separated list of addresses
