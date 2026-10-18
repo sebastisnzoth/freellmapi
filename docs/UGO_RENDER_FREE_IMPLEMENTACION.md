@@ -235,3 +235,9 @@ El usuario autorizó actualizar los PR y previews TEST si el cambio está verifi
 ### Canal web vigente — 18/10/2026 18:53 BRT
 
 El usuario informó Vercel pausado y descartó Netlify; único destino web: GitHub Pages. Se omiten previews Netlify de PR1/PR515 mediante marcador de título. Se desbloquea el push a sus ramas de desarrollo y CI exact-SHA, sin merge/main ni recursos/deploys remotos. GitHub Pages sólo sirve frontend estático; no ejecuta FreeAPI/SQLite/workers ni Edge Functions. Render conserva el carácter de backend preparado pero NO autorizado para crear/desplegar. La inferencia sigue bloqueada y el presupuestoUS$0.
+
+### Código publicado y evidencia — 18/10/2026
+
+Reemplaza el bloqueo anterior de publicación: código subido a PR1 en `d097ca1dcee6c5e87618a6e6e37b1617b1260895`, tree `1e8b8556282fcc8e4e7e19809c61d2b59287f07b`, idéntico al árbol local preparado. UGO publicado en PR515 en `f69b429c1dc64ff78fc10cf3707f69ebc3913725`, tree `2fe8d0731f83713e9e8b00fdcd51435ec8db9056`, también idéntico. Se preservan los padres originales y no se usa force. Publicación mediante conexión GitHub autorizada; terminal git carecía de credenciales de escritura. La revisión y pruebas locales corresponden al mismo código funcional, sin afirmar que los SHA locales sean los nuevos commits remotos.
+
+FreeAPI no devuelve runs Actions para d097ca1; CI remoto sigue sin verificar. UGO lanzó tres checks para f69b429c; siempre revalidar el HEAD actual. GitHub Pages es el único destino web; Vercel pausado por el usuario y Netlify omitido mediante marcador de título. Sin merge/main/Pages, sin servicios Render ni migraciones/secretos/inferencia. Los gates de backend real y facturación continúan abiertos.
