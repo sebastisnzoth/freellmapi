@@ -241,3 +241,26 @@ El usuario informó Vercel pausado y descartó Netlify; único destino web: GitH
 Reemplaza el bloqueo anterior de publicación: código subido a PR1 en `d097ca1dcee6c5e87618a6e6e37b1617b1260895`, tree `1e8b8556282fcc8e4e7e19809c61d2b59287f07b`, idéntico al árbol local preparado. UGO publicado en PR515 en `f69b429c1dc64ff78fc10cf3707f69ebc3913725`, tree `2fe8d0731f83713e9e8b00fdcd51435ec8db9056`, también idéntico. Se preservan los padres originales y no se usa force. Publicación mediante conexión GitHub autorizada; terminal git carecía de credenciales de escritura. La revisión y pruebas locales corresponden al mismo código funcional, sin afirmar que los SHA locales sean los nuevos commits remotos.
 
 FreeAPI no devuelve runs Actions para d097ca1; CI remoto sigue sin verificar. UGO lanzó tres checks para f69b429c; siempre revalidar el HEAD actual. GitHub Pages es el único destino web; Vercel pausado por el usuario y Netlify omitido mediante marcador de título. Sin merge/main/Pages, sin servicios Render ni migraciones/secretos/inferencia. Los gates de backend real y facturación continúan abiertos.
+
+
+### Fusión autorizada y verificada — 18/10/2026 22:23 UTC
+
+Este checkpoint reemplaza las restricciones históricas de «no merge/main» anteriores: el usuario solicitó «ya esta ok verifica para fusionar». PR515 se fusionó en `41919783ce14e859f63366297c98ea276ccdd34a` (tree `bb3114c8543f1a25f3615131c0bd037707885e4b`); PR1 en `77daf32976c83ecfe51a344d0c39ce3a1c86f842` (tree `67a81a04800e4ce552e2817be55c19285d6f7c37`). Los dos árboles son exactamente los de sus PR revisados; merge sin conflictos ni reescritura y preservando ambos padres. No se modificó código funcional después de las pruebas.
+
+Revalidación: Hive18/18PASS; FreeAPI19PASS/1SKIP. CI de PR515 HEAD38c8397: Core39170105838, CrossSecurity39170105845 y HugoTimeout39170105823, todosSUCCESS. FreeAPI no tiene evidencia de CI remoto; Docker y suite completa no verificados. La revisión independiente acredita únicamente preparación de código. Evidencia local completa permanece versionada en ambos repositorios.
+
+Los merge commits incluyen `[skip ci] [skip netlify] [ugo-test-only]`: se omite deliberadamente CI de push, porque el CI general UGO contiene probes reales de modelos y escrituras TEST y Docker FreeAPI publica imágenes en GHCR al recibir pushmain. No se declaran los SHA de merge como CI VALIDATED. Esta fusión no autoriza ni ejecuta esas consecuencias. El CI previo es evidencia de los checks del PR: no se puede inferir de ello ausencia absoluta de llamadas de sus probes ni facturación cero; no se auditaron consumos/facturas del proveedor. Las afirmaciones anteriores «0 llamadas» se refieren al ensayo local y ausencia de invocación manual directa, no a esos workflows existentes.
+
+GitHub Pages es el único canal web. A las22:23UTC, `/status.json` todavía publicaba7931173, de21:32:39UTC. Su workflow programado sigue habilitado, pero cron no garantiza puntualidad; no se declara la nueva revisión PUBLISHED. El conector disponible no ofrece workflow_dispatch, y relanzar un job antiguo no publica HEAD actual. Próximo paso de publicación: ejecutar `UGO GitHub Pages` en main o esperar el schedule y verificar success+source_sha público. No se activa Vercel/Netlify.
+
+No se creó/desplegó Render ni se modificaron schema/bucket/secrets/Edge remotos. Inferencia conserva HIVE_INFERENCE_NOT_ENABLED; Empresa AutónomaOFF. El gateway continúa rechazando FreeAPI hasta pinning verificable. No se crearon recursos pagos; presupuestoUS$0, factura no auditada.
+
+Consulta Sentinel/readiness de sólo lectura: ningún incidente observado para los nuevos SHA no demuestra runtimePASS, todavía no publicados. Persisten incidentes históricosP1 (incluye PROVIDER-AGENDA en otras revisiones); no se resuelven ni aprueban checklist ajenos a Hive. Los gates de Storage remoto, cuota multi-sesión real, facturación, primera misión y Judge/Sentinel runtime siguen pendientes.
+
+`TASK_ID | STATUS | REPO | BRANCH | SOURCE_SHA | RESULT_SHA | TESTS | RUN_ID | EVIDENCE | JUDGE | SENTINEL | COST | BLOCKER | NEXT_TASK`
+
+`MERGE-PREP | VERIFIED | both | main | UGO38c8397/FreeAPIf3d2fb4 | UGO4191978/FreeAPI77daf32 | árboles idénticos;18PASS;19PASS/1SKIP | CI39170105838/39170105845/39170105823+local-revalidation | merges+logs+PR515/PR1 | code-review independiente | consulta read-only;runtime no validado | sin recursos pagos nuevos;factura no auditada | ninguno para integración;gates backend abiertos | comprobar Pages y preparar pinning sin habilitar inferencia`
+
+`PUBLISH-PAGES | BLOCKED_EXTERNAL | ugo-admin-panel | main | 4191978 | no publicado observado | HTTP200/source_sha7931173 | último Pages39168233907 | status.json público | no ejecutado | no runtime nuevo | no gasto contratado | schedule pendiente/dispatch no disponible en conector | Run workflow UGO GitHub Pages/main y comprobar source_sha`
+
+Rollback de integración: nuevo commit revert revisado que revierta exclusivamente estos merges (parentmain), conservando trabajo concurrente; nunca reset/force. Reversión no elimina datos porque no se aplicaron migraciones remotas. Mantener bloqueos de inferencia y no restaurar cuotas desde SQLite.
