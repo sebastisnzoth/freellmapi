@@ -129,6 +129,15 @@ function readConfigFromEnv(): { source: string; value: unknown } | null {
   const configPath = process.env.FREEAPI_CONFIG_PATH?.trim();
   if (configPath) return { source: configPath, value: JSON.parse(fs.readFileSync(configPath, 'utf8')) };
 
+  // Render can inject a GROQ_API_KEY without an extra JSON secret. Import it
+  // through the existing encrypted declarative-key pipeline at startup.
+  // Never print the raw value, and do not touch other provider credentials.
+  const groq = process.env.GROQ_API_KEY?.trim();
+  if (groq) {
+    return { source: 'GROQ_API_KEY', value: {
+      keys: [{ platform: 'groq', key: groq, label: 'render-groq-env' }],
+    } };
+  }
   return null;
 }
 
