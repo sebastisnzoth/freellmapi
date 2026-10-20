@@ -18,7 +18,7 @@ import { getActiveProfileId, ensureModelInProfiles } from '../services/profile-m
 import { endpointScopeForBaseUrl, endpointScopeOfKey, qualifiedModelMemberId } from '../lib/endpoint-scope.js';
 import { clearCustomModelTombstone, recordCustomModelTombstone } from '../services/custom-model-tombstone.js';
 import { customModelSeed } from '../services/custom-model-seed.js';
-import { routePinnedModel } from '../services/router.js';
+import { routePinnedModel, failureAttributionFor } from '../services/router.js';
 import { logRequest } from '../lib/request-log.js';
 import { withKeyProxy } from '../lib/proxy.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
@@ -418,7 +418,7 @@ modelsRouter.post('/:id/test', async (req: Request, res: Response) => {
     const latencyMs = Date.now() - startTime;
     const error = sanitizeProviderErrorMessage(err instanceof Error ? err.message : String(err));
     logRequest(route.platform, route.modelId, route.keyId, 'error', 0, 0,
-      latencyMs, error, null, route.modelId, null, 'model-test');
+      latencyMs, error, null, route.modelId, null, 'model-test', failureAttributionFor(err));
     res.json({ success: false, modelId: route.modelId, latencyMs, error });
   } finally {
     route.release?.();
@@ -485,7 +485,9 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     // existing vocabulary for user-added rows is 'custom', so map 1:1 here —
     // this now also flags user models on native platforms (declarative
     // config / admin adds), which the old platform/key_id heuristic missed.
-    source: m.source === 'user' ? 'custom' : 'catalog',
+    // 'discovered' (#1348) marks rows fetched from a built-in provider's own
+    // /models because the catalog carries none for it.
+    source: m.source === 'user' ? 'custom' : m.source === 'discovered' ? 'discovered' : 'catalog',
     keyId: m.key_id ?? null,
     keyLabel: m.key_label ?? null,
     // Endpoint identity for custom rows (#651); null for catalog models and for

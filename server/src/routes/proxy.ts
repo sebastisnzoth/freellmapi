@@ -3,14 +3,19 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ChatToolCall, TokenUsage } from '@freellmapi/shared/types.js';
-import { type RouteResult, type ResolvedChain, type ChainRow, routeRequest, resolveRoutingChain, resolveModelGroupCandidates, resolveStickyPreference, hasEnabledVisionModel, hasEnabledToolsModel, routingReserveTokens } from '../services/router.js';
-import { secondsUntilNextMonth } from '../services/key-budget.js';
+import { type RouteResult, type ResolvedChain, type ChainRow, routeRequest, resolveRoutingChain, resolveModelGroupCandidates, resolveStickyPreference, hasEnabledVisionModel, hasEnabledToolsModel, routingReserveTokens, failureAttributionFor } from '../services/router.js';
+import { secondsUntilNextMonth, nextMonthResetAt } from '../services/key-budget.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
+import { runRerank, RerankError, rerankRetryAfterSec } from '../services/rerank.js';
+import { runSearch, SearchError, searchRetryAfterSec, listSearchEngines } from '../services/search.js';
+import { runDecision, DecisionError, decisionRetryAfterSec, listDecisionModels, DECISION_QUESTION_TYPES } from '../services/decision.js';
+import { retryAfterSeconds } from '../lib/retry-hint.js';
 import { runImageGeneration, runVideoGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSCRIPTION_BYTES } from '../services/media.js';
 import multer from 'multer';
 import { getDb } from '../db/index.js';
 import { resolveAuth, prependSystemPrompt, type ResolvedAuth } from '../lib/system-prompt.js';
-import { contentToString, messageHasImage, normalizeOutboundContent, sanitizeResponse, truncateMessagesForGithub } from '../lib/content.js';
+import { contentToString, estimateInputTokens, messageHasImage, normalizeOutboundContent, sanitizeResponse } from '../lib/content.js';
+import { routeOutputBudget } from '../lib/output-cap.js';
 import { resolveTaskType } from '../lib/task-type.js';
 import { normalizeMessageImages } from '../lib/image-normalize.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -33,8 +38,9 @@ import type { Platform } from '@freellmapi/shared/types.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import { buildModelListing, type NormalizedModel } from '../services/model-listing.js';
-import { claudeFamilyDiscoveryEntries } from '../services/anthropic-map.js';
+import { claudeFamilyDiscoveryEntries, resolveListedClaudeAlias } from '../services/anthropic-map.js';
 import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
+import { applyDecisionRouting, routingStrategyHeader } from '../services/routing-decision.js';
 
 export const proxyRouter = Router();
 
@@ -466,6 +472,60 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
 });
 
 
+// GET /v1/usage — self-service consumption for inference clients (#1568).
+//
+// OpenRouter exposes GET /api/v1/auth/key (usage + limits for the calling key)
+// and LiteLLM exposes /key/info; every agent user who wonders "what happened
+// to my 120M tokens" currently has to open the dashboard to find out. This
+// puts the same answer behind the key that spent the tokens: one month-to-date
+// roll-up of successful proxied requests, split by provider platform, plus
+// when the window resets.
+//
+// Reads the durable key_monthly_usage ledger (the per-key monthly-cap source),
+// NOT the analytics table, so retention pruning can never make the answer
+// disagree with what the caps enforce. Aggregated per PROVIDER key joined to
+// api_keys for the platform label; requests whose key was deleted have already
+// dropped out of the ledger's join and are reported under "removed".
+//
+// The ledger is install-wide (requests are not tagged with the client profile
+// that sent them), so only the unified key may read it. A client-profile key
+// (sk-cp-...) is handed to a downstream client and must not see what every
+// other client spent.
+proxyRouter.get('/usage', (req: Request, res: Response) => {
+  const auth = requireInferenceAuth(req, res);
+  if (!auth) return;
+  if (auth.kind !== 'unified') {
+    res.status(403).json({ error: { message: 'Usage is only available to the unified API key', type: 'permission_error' } });
+    return;
+  }
+
+  const month = new Date().toISOString().slice(0, 7);
+  const db = getDb();
+  const totals = db.prepare(`
+    SELECT COALESCE(SUM(requests), 0) AS requests, COALESCE(SUM(tokens), 0) AS tokens
+    FROM key_monthly_usage WHERE month = ?
+  `).get(month) as { requests: number; tokens: number };
+  const byPlatform = db.prepare(`
+    SELECT COALESCE(k.platform, 'removed') AS platform,
+           SUM(u.requests) AS requests, SUM(u.tokens) AS tokens
+    FROM key_monthly_usage u
+    LEFT JOIN api_keys k ON k.id = u.key_id
+    WHERE u.month = ?
+    GROUP BY COALESCE(k.platform, 'removed')
+    ORDER BY tokens DESC, requests DESC
+  `).all(month) as { platform: string; requests: number; tokens: number }[];
+
+  res.json({
+    object: 'usage',
+    month,
+    resetsAt: nextMonthResetAt(),
+    requests: totals.requests,
+    tokens: totals.tokens,
+    byPlatform,
+  });
+});
+
+
 const MAX_RETRIES = 20;
 
 // Echo-tolerant tool calls: agents replay OUR responses back as history, and
@@ -696,6 +756,198 @@ proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
   }
 });
 
+// Cohere/Jina-style rerank over the key pool (#1029). No catalog: a Cohere key
+// or a custom OpenAI-compatible endpoint exposing POST {base_url}/rerank is a
+// provider; the first success wins, custom endpoints tried first.
+const RerankBody = z.object({
+  model: z.string().optional(),
+  query: z.string().min(1),
+  documents: z.array(z.string()).min(1),
+  top_n: z.number().int().positive().optional(),
+});
+
+proxyRouter.post('/rerank', async (req: Request, res: Response) => {
+  if (!requireInferenceAuth(req, res)) return;
+  const parsed = RerankBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: 'Invalid request: `query` and `documents` are required', type: 'invalid_request_error' } });
+    return;
+  }
+  try {
+    const result = await runRerank(parsed.data.model, parsed.data.query, parsed.data.documents, parsed.data.top_n);
+    res.json({
+      results: result.results.map(r => ({
+        index: r.index,
+        relevance_score: r.relevanceScore,
+        document: { text: r.document },
+      })),
+      model: result.modelId,
+      provider: result.platform,
+    });
+  } catch (err: any) {
+    const status = err instanceof RerankError ? err.status : 502;
+    if (err instanceof RerankError) {
+      const retryAfter = rerankRetryAfterSec(err);
+      if (retryAfter !== undefined) res.setHeader('Retry-After', String(retryAfter));
+    }
+    const type = status === 400 ? 'invalid_request_error' : status === 429 ? 'rate_limit_error' : 'server_error';
+    res.status(status).json({ error: { message: `rerank error: ${err?.message ?? 'unknown'}`, type } });
+  }
+});
+
+// Web search over the key pool (#1174). Engines are catalog rows (Tavily,
+// Exa, Firecrawl, Linkup, plus custom relays speaking Tavily's wire shape);
+// the first engine that returns hits wins. See services/search.ts.
+const SearchBody = z.object({
+  query: z.string().min(1),
+  max_results: z.number().int().positive().optional(),
+  topic: z.enum(['general', 'news']).optional(),
+  include_answer: z.boolean().optional(),
+  engine: z.string().min(1).optional(),
+});
+
+proxyRouter.post('/search', async (req: Request, res: Response) => {
+  if (!requireInferenceAuth(req, res)) return;
+  const parsed = SearchBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: 'Invalid request: `query` is required', type: 'invalid_request_error' } });
+    return;
+  }
+  // A departed client drops the upstream search instead of spending a credit.
+  const abort = new AbortController();
+  res.on('close', () => { if (!res.writableFinished) abort.abort(); });
+  try {
+    const result = await runSearch(parsed.data.query, {
+      maxResults: parsed.data.max_results,
+      topic: parsed.data.topic,
+      includeAnswer: parsed.data.include_answer,
+      engine: parsed.data.engine,
+      signal: abort.signal,
+    });
+    res.json({
+      query: result.query,
+      ...(result.answer !== undefined ? { answer: result.answer } : {}),
+      results: result.results,
+      provider: result.provider,
+      engine: result.engine,
+    });
+  } catch (err: any) {
+    if (res.headersSent || abort.signal.aborted) return;
+    const status = err instanceof SearchError ? err.status : 502;
+    if (err instanceof SearchError) {
+      const retryAfter = searchRetryAfterSec(err);
+      if (retryAfter !== undefined) res.setHeader('Retry-After', String(retryAfter));
+    }
+    const type = status === 400 ? 'invalid_request_error' : status === 429 ? 'rate_limit_error' : 'server_error';
+    res.status(status).json({
+      error: {
+        message: `search error: ${err?.message ?? 'unknown'}`,
+        type,
+        ...(err instanceof SearchError && err.code ? { code: err.code } : {}),
+      },
+    });
+  }
+});
+
+// The engines a caller can pin with `engine` on POST /v1/search.
+proxyRouter.get('/search/engines', (req: Request, res: Response) => {
+  if (!requireInferenceAuth(req, res)) return;
+  res.json({
+    object: 'list',
+    data: listSearchEngines()
+      .filter(e => e.enabled)
+      .map(e => ({
+        id: e.engineId,
+        object: 'search_engine',
+        provider: e.platform,
+        name: e.displayName,
+        available: e.healthyKeyCount > 0,
+      })),
+  });
+});
+
+// Decision models over the key pool. A decision model answers typed questions
+// about `state` (pick one option, yes/no, or a score) with probabilities
+// instead of generated text. Request shape is "System One":
+//   { model?, state, questions: { <id>: { type, instructions, criteria? } } }
+// Catalog rows only (Cloudflare Clef, OpenRouter Mercury Decide), on the keys
+// the user already has for those platforms. Never used by chat routing.
+// See services/decision.ts. /v1/systemone is an alias for System One clients.
+const DecisionQuestionBody = z.object({
+  type: z.enum(DECISION_QUESTION_TYPES),
+  instructions: z.unknown().refine(v => v !== undefined && v !== null && v !== '', { message: 'instructions is required' }),
+  criteria: z.unknown().optional(),
+}).passthrough();
+
+const DecisionBody = z.object({
+  model: z.string().min(1).optional(),
+  state: z.unknown().refine(v => v !== undefined && v !== null && v !== '', { message: 'state is required' }),
+  questions: z.record(z.string().min(1).max(100), DecisionQuestionBody)
+    .refine(q => Object.keys(q).length >= 1 && Object.keys(q).length <= 64, { message: 'questions must hold 1 to 64 entries' }),
+});
+
+async function handleDecision(req: Request, res: Response): Promise<void> {
+  if (!requireInferenceAuth(req, res)) return;
+  const parsed = DecisionBody.safeParse(req.body);
+  if (!parsed.success) {
+    const detail = parsed.error.errors.map(e => `${e.path.join('.') || 'body'}: ${e.message}`).join('; ');
+    res.status(400).json({ error: { message: `Invalid request: ${detail}`, type: 'invalid_request_error' } });
+    return;
+  }
+  const abort = new AbortController();
+  res.on('close', () => { if (!res.writableFinished) abort.abort(); });
+  try {
+    const { model, state, questions } = parsed.data;
+    const result = await runDecision(
+      { state, questions: questions as Parameters<typeof runDecision>[0]['questions'] },
+      { model, signal: abort.signal },
+    );
+    res.json({
+      object: 'decision',
+      model: result.model,
+      provider: result.provider,
+      answers: result.answers,
+      usage: result.usage,
+    });
+  } catch (err: any) {
+    if (res.headersSent || abort.signal.aborted) return;
+    const status = err instanceof DecisionError ? err.status : 502;
+    if (err instanceof DecisionError) {
+      const retryAfter = decisionRetryAfterSec(err);
+      if (retryAfter !== undefined) res.setHeader('Retry-After', String(retryAfter));
+    }
+    const type = status === 400 ? 'invalid_request_error' : status === 429 ? 'rate_limit_error' : 'server_error';
+    res.status(status).json({
+      error: {
+        message: `decision error: ${err?.message ?? 'unknown'}`,
+        type,
+        ...(err instanceof DecisionError && err.code ? { code: err.code } : {}),
+      },
+    });
+  }
+}
+
+proxyRouter.post('/decisions', handleDecision);
+proxyRouter.post('/systemone', handleDecision);
+
+// The decision models a caller can pin with `model` on POST /v1/decisions.
+proxyRouter.get('/decisions/models', (req: Request, res: Response) => {
+  if (!requireInferenceAuth(req, res)) return;
+  res.json({
+    object: 'list',
+    data: listDecisionModels()
+      .filter(m => m.enabled)
+      .map(m => ({
+        id: m.modelId,
+        object: 'decision_model',
+        provider: m.platform,
+        name: m.displayName,
+        context_window: m.contextWindow,
+        available: m.healthyKeyCount > 0,
+      })),
+  });
+});
+
 // OpenAI-compatible image generation. Routed through the media catalog (its own
 // table, never the chat router): `model: "auto"` (or omitted) tries every enabled
 // image provider in order; a provider model id pins to that one. Failover is
@@ -708,8 +960,12 @@ const ImageBody = z.object({
   response_format: z.enum(['url', 'b64_json']).optional(),
 });
 
-function inferenceBudgetCode(error: { code?: string }, res: Response): { code?: string } {
-  if (error.code === 'quota_exceeded') res.setHeader('Retry-After', secondsUntilNextMonth());
+function inferenceBudgetCode(error: { code?: string; retryAfterMs?: number }, res: Response): { code?: string } {
+  // retryAfterMs is set by the embeddings/media services only when the whole
+  // chain was rate limited (soonest stated back-off, budget resets included),
+  // so it wins over the month-long budget reset when a sibling returns sooner.
+  if (error.retryAfterMs !== undefined) res.setHeader('Retry-After', retryAfterSeconds(error.retryAfterMs));
+  else if (error.code === 'quota_exceeded') res.setHeader('Retry-After', secondsUntilNextMonth());
   return error.code ? { code: error.code } : {};
 }
 
@@ -1048,8 +1304,12 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
     return;
   }
 
-  const { model: requestedModel, prompt, suffix, temperature, top_p, stream } = parsed.data;
-  const requestedModelLabel = requestedModel ?? 'auto';
+  const { model: clientModel, prompt, suffix, temperature, top_p, stream } = parsed.data;
+  const requestedModelLabel = clientModel ?? 'auto';
+  // Claude alias from GET /v1/models → the Claude family map, as on /v1/chat/completions.
+  const claudeAlias = resolveListedClaudeAlias(clientModel);
+  const requestedModel = claudeAlias?.kind === 'model' ? claudeAlias.modelId : claudeAlias ? 'auto' : clientModel;
+  const aliasTierChain = claudeAlias?.kind === 'tier' ? resolveModelGroupCandidates(claudeAlias.dbIds) : [];
   const max_tokens = parsed.data.max_tokens != null && parsed.data.max_tokens > 0
     ? parsed.data.max_tokens : 128;
   const stop = providerSafeStop(parsed.data.stop);
@@ -1081,9 +1341,9 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   }
 
   let preferredModel: number | undefined;
-  let groupChain: ChainRow[] | undefined;
+  let groupChain: ChainRow[] | undefined = aliasTierChain.length > 0 ? aliasTierChain : undefined;
 
-  if (!isAutoModel(requestedModel) && requestedModel) {
+  if (!groupChain && !isAutoModel(requestedModel) && requestedModel) {
     const db = getDb();
     const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModel, getModelGroups()) : null;
     const members = resolved?.memberDbIds ?? null;
@@ -1187,6 +1447,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       );
     },
     dispatch: async (route, attempt, ctx) => {
+      const contextBudget = routeOutputBudget(route, estimatedInputTokens);
       traceRouteEvent('Proxy', {
         event: attempt === 0 ? 'start' : 'next',
         requestId: requestGroupId,
@@ -1195,12 +1456,6 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         model: route.modelId,
         requestedModel: attempt === 0 ? requestedModelLabel : undefined,
       });
-
-      // Same GitHub input ceiling as /chat/completions below: trim the
-      // dispatched copy so a long legacy prompt doesn't 413 the github hop.
-      const dispatchMessages = route.platform === 'github'
-        ? truncateMessagesForGithub(messages)
-        : messages;
 
       if (stream) {
         let totalOutputTokens = 0;
@@ -1232,9 +1487,9 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey,
-            dispatchMessages,
+            messages,
             route.modelId,
-            { temperature, max_tokens, top_p, stop, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
+            { temperature, max_tokens, top_p, stop, contextBudget, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
             quotaContextForRoute(route, 'chat/completions'),
           );
 
@@ -1323,7 +1578,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
               latencyMs: Date.now() - start,
               error: sanitizeProviderErrorMessage(streamErr.message),
             });
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, null, 'http');
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, null, 'http', failureAttributionFor(streamErr));
             return 'committed';
           }
           throw streamErr;
@@ -1332,9 +1587,9 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 
       const result = await route.provider.chatCompletion(
         route.apiKey,
-        dispatchMessages,
+        messages,
         route.modelId,
-        { temperature, max_tokens, top_p, stop, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
+        { temperature, max_tokens, top_p, stop, contextBudget, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
         quotaContextForRoute(route, 'chat/completions'),
       );
 
@@ -1380,7 +1635,16 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
           logprobs: null,
           finish_reason: result.choices?.[0]?.finish_reason ?? 'stop',
         }],
-        usage: result.usage,
+        // `usage` is required by the OpenAI completions spec. The fallback
+        // counts computed just above (chars/4 when the provider omits usage,
+        // #764) existed but were dropped here — clients like editor
+        // ghost-text plugins read usage to throttle and saw `undefined`.
+        usage: result.usage ?? {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: totalTokens,
+          estimated: true,
+        },
         execution_id: requestGroupId,
       });
 
@@ -1409,7 +1673,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         latencyMs: latency,
         error: safeError,
       });
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, null, 'http');
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, null, 'http', failureAttributionFor(err));
     },
     onFatal: (route, err, attempt) => {
       setFallbackHeaders(res, attempt, attemptLog);
@@ -1467,8 +1731,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
-  const { model: requestedModel, temperature, top_p, stream } = parsed.data;
-  const requestedModelLabel = requestedModel ?? 'auto';
+  const { model: clientModel, temperature, top_p, stream } = parsed.data;
+  const requestedModelLabel = clientModel ?? 'auto';
+  // A Claude alias from GET /v1/models routes through the Claude family map
+  // (a pinned model, auto, or a tier pool), the same as on /v1/messages.
+  const claudeAlias = resolveListedClaudeAlias(clientModel);
+  const requestedModel = claudeAlias?.kind === 'model' ? claudeAlias.modelId : claudeAlias ? 'auto' : clientModel;
+  const aliasTierChain = claudeAlias?.kind === 'tier' ? resolveModelGroupCandidates(claudeAlias.dbIds) : [];
   // Agent-tolerant knob normalization (#200): max_tokens <= 0 means "no
   // limit" in several clients → unset; tool_choice 'any' is OpenAI's
   // 'required'; tool definitions get their 'function' type re-defaulted.
@@ -1614,10 +1883,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Non-streaming requests reconcile against the provider's real `usage` block;
   // streaming does the same when stream_options.include_usage produces a final
   // usage frame, and otherwise falls back to this estimate.
-  const estimatedInputTokens = messages.reduce((sum, m) => {
-    const text = contentToString(m.content);
-    return sum + Math.ceil(text.length / 4);
-  }, 0);
+  const estimatedInputTokens = estimateInputTokens(messages, tools);
 
   // Image requests must route to a vision-capable model. Reject up front with a
   // clear message when none is enabled, rather than silently dropping the image
@@ -1776,7 +2042,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         const type = err instanceof FusionError
           ? (err.status === 429 ? 'rate_limit_error' : err.status >= 500 ? 'server_error' : 'invalid_request_error')
           : 'server_error';
-        writeFrame({ error: { message, type } });
+        const code = err instanceof FusionError ? err.code : undefined;
+        writeFrame({ error: { message, type, ...(code ? { code } : {}) } });
       }
       try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
       return;
@@ -1816,6 +2083,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           error: {
             message: err.message,
             type: err.status === 429 ? 'rate_limit_error' : err.status >= 500 ? 'server_error' : 'invalid_request_error',
+            ...(err.code ? { code: err.code } : {}),
           },
           execution_id: requestGroupId,
         });
@@ -1913,6 +2181,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         max_tokens,
         tools,
         tool_choice,
+        generationOptions: { stop, parallel_tool_calls, ...samplingParams },
       })
     : null;
   if (idemKey && idemFingerprint) {
@@ -1996,7 +2265,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // successful provider without leaking stickiness across groups.
   let stickyStrategyKey: string | undefined = strategyKey;
 
-  if (isAutoModel(requestedModel)) {
+  if (aliasTierChain.length > 0) {
+    // A tier-mapped Claude alias routes STRICTLY over its tier's pool. An
+    // empty tier falls through to plain auto, as on /v1/messages.
+    groupChain = aliasTierChain;
+    stickyStrategyKey = `tier:${aliasTierChain[0]!.model_db_id}`;
+    const sticky = getStickyModel(messages, sessionIdHeader, stickyStrategyKey);
+    preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
+  } else if (isAutoModel(requestedModel)) {
     preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader, strategyKey), resolvedChain?.chain);
   } else if (requestedModel) {
     const db = getDb();
@@ -2084,6 +2360,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // in-flight upstream instead of waiting for a stalled attempt to time out.
   const hedgeAbort = new AbortController();
 
+  // Decision routing (#1354): with the 'decision' strategy on, a decision
+  // model picks which preset (Smartest / Fastest / Balanced / Most reliable)
+  // this turn routes with. Skipped when the client pinned a model or the
+  // conversation is sticky to one. Any doubt routes as Balanced.
+  const routingPick = await applyDecisionRouting(messages, { pinned: pinnedModelId != null || preferredModel != null, signal: clientAbort.signal });
+  if (routingPick && !res.headersSent) res.setHeader('X-FreeLLM-Routing-Strategy', routingStrategyHeader(routingPick));
+
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
     state,
@@ -2106,6 +2389,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined, outputReserve, taskType);
     },
     dispatch: async (route, attempt, ctx) => {
+    const contextBudget = routeOutputBudget(route, estimatedInputTokens);
     const modelKey = `${route.platform}:${route.modelId}`;
     traceRouteEvent('Proxy', {
       event: attempt === 0 ? 'start' : 'next',
@@ -2139,16 +2423,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const rememberedReasoning = rememberedReasoningFor(reasoningSessionKey, modelKey);
     if (rememberedReasoning) {
       outboundMessages = restoreSessionReasoning(outboundMessages, rememberedReasoning, route.platform);
-    }
-
-    // GitHub Models 413s a history above its input ceiling instead of
-    // truncating it, so a long conversation burns the github hop of every
-    // chain it appears in. Trim the outbound copy to what the platform will
-    // accept — scoped to this attempt, so the next candidate still sees the
-    // client's full history. A no-op returning the same array when the
-    // request already fits.
-    if (route.platform === 'github') {
-      outboundMessages = truncateMessagesForGithub(outboundMessages);
     }
 
       if (stream) {
@@ -2248,7 +2522,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, outboundMessages, route.modelId,
-            { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, stream_options: parsed.data.stream_options, ...samplingParams, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
+            { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, stream_options: parsed.data.stream_options, ...samplingParams, contextBudget, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
             quotaContextForRoute(route, 'chat/completions'),
           );
 
@@ -2285,7 +2559,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
                 latencyMs: Date.now() - start,
                 error: sanitizeProviderErrorMessage(String(msg)),
               });
-              logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, ttfbMs, pinnedModelId, null, 'http');
+              logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, ttfbMs, pinnedModelId, null, 'http', failureAttributionFor({ message: String(msg) }));
               return 'committed';
             }
 
@@ -2618,7 +2892,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               latencyMs: Date.now() - start,
               error: sanitizeProviderErrorMessage(streamErr.message),
             });
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, null, 'http');
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, null, 'http', failureAttributionFor(streamErr));
             return 'committed';
           }
           // Headers never sent — bubble to the shared loop, which cooldowns this
@@ -2630,7 +2904,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, outboundMessages, route.modelId,
-          { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
+          { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams, contextBudget, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
           quotaContextForRoute(route, 'chat/completions'),
         );
 
@@ -2865,7 +3139,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         latencyMs: latency,
         error: safeError,
       });
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, null, 'http');
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, null, 'http', failureAttributionFor(err));
     },
     onFatal: (route, err, attempt) => {
       // Non-retryable error (bare 4xx, etc.): don't retry.

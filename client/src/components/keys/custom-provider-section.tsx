@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { ListPlus } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -12,6 +13,7 @@ import { isHttpUrl } from '@/lib/validate'
 import { useI18n } from '@/i18n'
 import { toast } from '@/lib/toast'
 import { DiscoverModelsDialog } from './discover-models-dialog'
+import { GroupLabelField } from './group-label-field'
 
 // Split a free-text model field on commas / newlines into a clean id list,
 // dropping blanks and duplicates so one endpoint can take several models. (#281)
@@ -35,6 +37,8 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
   const [displayName, setDisplayName] = useState('')
   const [family, setFamily] = useState('')
   const [apiKey, setApiKey] = useState('')
+  // Endpoint group (#1176); blank = the default Custom group.
+  const [groupLabel, setGroupLabel] = useState('')
   // Chat models default tools on (modern OpenAI-compatible servers all emit tool
   // calls) and vision off; declare them here or flip them later per model. (#470)
   const [supportsTools, setSupportsTools] = useState(true)
@@ -105,6 +109,7 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
           models,
           displayName: !multiple ? (displayName || undefined) : undefined,
           apiKey: apiKey || undefined,
+          groupLabel: groupLabel.trim() || undefined,
           supportsTools,
           supportsVision,
         },
@@ -178,14 +183,16 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
           <div className="flex items-center justify-between gap-2">
             <Label className="text-xs">{customType === 'chat' ? t('keys.customModels') : t('keys.customModel')}</Label>
             {customType === 'chat' && (
-              <button
+              <Button
                 type="button"
+                variant="outline"
+                size="xs"
                 onClick={() => setDiscoverOpen(true)}
                 disabled={!!baseUrlError}
-                className="text-[11px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:pointer-events-none disabled:opacity-50"
               >
+                <ListPlus data-icon="inline-start" />
                 {t('keys.discoverModels')}
-              </button>
+              </Button>
             )}
           </div>
           <Textarea
@@ -244,6 +251,9 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
             className="w-[150px] font-mono text-xs"
           />
         </div>
+        {customType === 'chat' && (
+          <GroupLabelField value={groupLabel} onChange={setGroupLabel} className="w-[150px]" showHint={false} />
+        )}
         <Button type="submit" size="sm" disabled={addCustom.isPending}>
           {addCustom.isPending ? t('keys.addingCustom') : addLabel}
         </Button>
@@ -263,7 +273,7 @@ export function CustomProviderSection({ onAdded }: { onAdded?: () => void } = {}
         <DiscoverModelsDialog
           open={discoverOpen}
           onOpenChange={setDiscoverOpen}
-          endpoint={{ baseUrl, apiKey: apiKey || undefined }}
+          endpoint={{ baseUrl, apiKey: apiKey || undefined, groupLabel }}
           onRegistered={onAdded}
         />
       )}

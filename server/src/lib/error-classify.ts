@@ -352,8 +352,17 @@ export function isKeyAuthError(err: any): boolean {
 // makes the router re-pick a dead-for-the-day provider all day, so the caller
 // benches until the next UTC midnight instead. Requires BOTH a daily marker and
 // a quota/allocation marker so an ordinary per-minute 429 never matches.
+//
+// Groq ends every limit error, per-minute and request-too-large alike, with
+// "Need more tokens? Upgrade to Dev Tier today at …". That "today" is sales
+// copy, not a window, so it is cut before looking for a daily marker; and a
+// request too big for the model is never a spent allowance.
+const UPGRADE_UPSELL = /\bupgrade to [^.?!]*?\btoday\b/g;
+
 export function isDailyQuotaExhaustedError(err: any): boolean {
-  const msg = (err?.message ?? '').toLowerCase();
+  if (err?.dailyQuotaExhausted === true) return true;
+  if (isContextTooLargeError(err)) return false;
+  const msg = (err?.message ?? '').toLowerCase().replace(UPGRADE_UPSELL, '');
   if (!/daily|per[ -_]?day|\btoday\b/.test(msg)) return false;
   return /allocation|quota|limit|exhaust|used up/.test(msg);
 }
@@ -403,6 +412,36 @@ export function isProviderLevelError(err: any): boolean {
   return isTimeoutErrorText(msg)
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('fetch failed');   // undici transport error (DNS/TLS/proxy down)
+}
+
+// #1347 (PR 1): provider-moment failures — the "provider had a bad minute"
+// class: a 429, a 5xx, a degraded deployment, a timeout, a transport drop
+// (including a mid-stream reset / truncated SSE), or rate-limit wording on a
+// response that carried no structured status. This is evidence about the
+// provider's minute, not the model's quality: when failure attribution is
+// enabled such failures still steer the key (the cooldown ladder is
+// untouched) but are excluded from the model-level books — the reliability
+// stats and the failure penalties. Deliberately NOT in this class: auth
+// (401/403), quota (402), model-not-found (404/410), context-too-large,
+// empty completions and model-scoped 400s, which keep their existing
+// key/model-scoped handling.
+export function isProviderMomentFailure(err: any): boolean {
+  // A canceled request (client hang-up, time-budget hedge) is the gateway's
+  // own doing. isTransportError already treats those as non-transport, but
+  // the timeout-marker text check below could still match an abort message.
+  if (isClientAbortError(err) || isHedgeAbortError(err)) return false;
+  if (err?.skipModelForRequest === true) return false;
+  const status = typeof err?.status === 'number' ? err.status : 0;
+  if (status === 429 || status >= 500) return true;
+  if (isProviderDegradedError(err)) return true;
+  if (isTransportError(err)) return true;
+  if (isStreamTruncatedError(err)) return true;
+  const msg = (err?.message ?? '').toLowerCase();
+  if (isTimeoutErrorText(msg)) return true;
+  // Rate-limit wording without a structured status: some gateways answer a
+  // throttled request with a 200/500 body that only says "rate limit".
+  if (status === 0 && (msg.includes('rate limit') || msg.includes('too many requests'))) return true;
+  return false;
 }
 
 // #809: kilo's free relay occasionally answers with a bare classification
@@ -463,12 +502,22 @@ export function isContextTooLargeError(err: any): boolean {
   if (typeof err?.code === 'string' && err.code.toLowerCase() === 'context_length_exceeded') return true;
   const msg = (err?.message ?? '').toLowerCase();
   return msg.includes('context_length_exceeded')
+    // Agnes AI and some OpenAI-compat aggregators raise a bare
+    // ContextWindowExceededError whose OpenAIException body arrives truncated
+    // mid-sentence ("The input (2250074 tokens) is longer than the mo…"), so
+    // the "maximum context length" marker below never sees its target text and
+    // the error was mis-bucketed as provider_bad_request. The exception class
+    // name is the only reliable signal left in that shape.
+    || msg.includes('contextwindowexceeded')
     || msg.includes('maximum context length')
     || msg.includes('context length exceeded')
     || /exceeds[^.]*context (length|window|size)/.test(msg)
     || msg.includes('prompt is too long')
     || msg.includes('input is too long')
     || /input token count[^.]*exceeds/.test(msg)
+    // "The input (N tokens) is longer than the max/maximum" family, worded
+    // differently by aggregators that never surface an exception class.
+    || /input[^.]*longer than (the )?(max|maximum)/.test(msg)
     || msg.includes('exceeds the maximum number of tokens')
     || msg.includes('request too large')
     || msg.includes('payload too large')
@@ -485,11 +534,26 @@ export function isContextTooLargeError(err: any): boolean {
 // A 402 Payment Required / out-of-credits error. Distinct from a transient 429:
 // it won't recover on the next window, so the caller benches the model+key with
 // PAYMENT_REQUIRED_COOLDOWN_MS (a full day) rather than the 90s transient cooldown.
+//
+// The digits 402 only count as the STATUS. A bare `includes('402')` also
+// matched token counts and request ids ("Limit 30000, Requested 34026",
+// "14023 tokens used"), and since the 402 bench covers the key on every model
+// of the platform for a day (#1239), one unlucky number took a whole provider
+// out. So: an error that states another status is never a 402 by its digits,
+// and otherwise 402 has to stand alone rather than sit inside a longer number.
+const STATED_STATUS = /\bapi error (\d{3})\b|\(http (\d{3})\)/;
+const STANDALONE_402 = /(?<![\w.])402(?![\w.])/;
+
 export function isPaymentRequiredError(err: any): boolean {
-  const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('402') || msg.includes('payment required')
+  const msg = String(err?.message ?? '').toLowerCase();
+  if (msg.includes('payment required')
     || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
-    || msg.includes('insufficient balance');
+    || msg.includes('insufficient balance')) return true;
+
+  const stated = msg.match(STATED_STATUS);
+  const status = typeof err?.status === 'number' ? err.status : Number(stated?.[1] ?? stated?.[2]);
+  if (Number.isFinite(status)) return status === 402;
+  return STANDALONE_402.test(msg);
 }
 
 // "model 'x' does not exist" / "model \"x\" does not exist" / "model x does not

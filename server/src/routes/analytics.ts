@@ -4,6 +4,7 @@ import { getDb } from '../db/index.js';
 import { FALLBACK_INPUT_PER_M, FALLBACK_OUTPUT_PER_M } from '../db/model-pricing.js';
 import { providerIdFor, providerDisplayName } from '../lib/provider-identity.js';
 import { normalizeBaseUrl } from '../lib/endpoint-scope.js';
+import { searchAnalytics, type SearchAnalyticsRange } from '../services/search.js';
 
 export const analyticsRouter = Router();
 
@@ -23,6 +24,15 @@ const ENDPOINT_ID_SQL = "COALESCE(rtrim(trim(k.base_url), '/'), '')";
 // Format UTC timestamps the same way SQLite stores created_at text values.
 const toSqliteDateTime = (timestamp: number) =>
     new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
+
+// First value only — Express hands back an array for a repeated query param,
+// and a repeated filter is a client bug, not two filters. Same contract as
+// routes/logs.ts.
+function firstParam(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) && typeof value[0] === 'string') return value[0];
+  return undefined;
+}
 
 // Return the rolling cutoff timestamp for the selected analytics range.
 function getSinceTimestamp(range: string): string {
@@ -83,6 +93,16 @@ function readLifetimeSettings() {
 }
 
 // Summary stats
+// Web searches (#1174) live in their own log (search_requests), so they never
+// show up in the chat totals above; the dashboard's search cards read this.
+const SEARCH_RANGES: readonly SearchAnalyticsRange[] = ['24h', '7d', '30d', '90d', 'all'];
+
+analyticsRouter.get('/search', (req: Request, res: Response) => {
+  const raw = typeof req.query.range === 'string' ? req.query.range : '7d';
+  const range = (SEARCH_RANGES as readonly string[]).includes(raw) ? raw as SearchAnalyticsRange : '7d';
+  res.json(searchAnalytics(range));
+});
+
 analyticsRouter.get('/summary', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
   const since = getSinceTimestamp(range);
@@ -483,19 +503,24 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
   const since = getSinceTimestamp(range);
   const db = getDb();
 
-  // Group errors by category (extract the key part of the error message)
+  // Group errors by category (extract the key part of the error message).
+  // LOWER() first: LIKE is case-sensitive in SQLite, and the error strings we
+  // persist are dominated by capitalized upstream messages ("Invalid API key",
+  // "Too Many Requests", "Timeout"), which all landed in 'Other' before. The
+  // old '%invalid.*key%' pattern was regex syntax pasted into LIKE, where '.'
+  // and '*' are literal characters, so it matched nothing real.
   const rows = db.prepare(`
     SELECT
       platform,
       model_id,
       CASE
-        WHEN error LIKE '%429%' OR error LIKE '%rate limit%' OR error LIKE '%too many%' OR error LIKE '%quota%' THEN 'Rate Limited (429)'
-        WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid.*key%' THEN 'Auth Error (401)'
-        WHEN error LIKE '%403%' OR error LIKE '%forbidden%' THEN 'Forbidden (403)'
-        WHEN error LIKE '%404%' OR error LIKE '%not found%' THEN 'Not Found (404)'
-        WHEN error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
-        WHEN error LIKE '%500%' OR error LIKE '%internal server%' THEN 'Server Error (500)'
-        WHEN error LIKE '%503%' OR error LIKE '%unavailable%' THEN 'Unavailable (503)'
+        WHEN lower(error) LIKE '%429%' OR lower(error) LIKE '%rate limit%' OR lower(error) LIKE '%too many%' OR lower(error) LIKE '%quota%' THEN 'Rate Limited (429)'
+        WHEN lower(error) LIKE '%401%' OR lower(error) LIKE '%unauthorized%' OR lower(error) LIKE '%invalid api key%' OR lower(error) LIKE '%invalid_api_key%' OR lower(error) LIKE '%incorrect api key%' THEN 'Auth Error (401)'
+        WHEN lower(error) LIKE '%403%' OR lower(error) LIKE '%forbidden%' THEN 'Forbidden (403)'
+        WHEN lower(error) LIKE '%404%' OR lower(error) LIKE '%not found%' THEN 'Not Found (404)'
+        WHEN lower(error) LIKE '%timeout%' OR lower(error) LIKE '%timed out%' OR lower(error) LIKE '%etimedout%' OR lower(error) LIKE '%econnrefused%' THEN 'Timeout/Connection'
+        WHEN lower(error) LIKE '%500%' OR lower(error) LIKE '%internal server%' THEN 'Server Error (500)'
+        WHEN lower(error) LIKE '%503%' OR lower(error) LIKE '%unavailable%' THEN 'Unavailable (503)'
         ELSE 'Other'
       END as error_category,
       COUNT(*) as count
@@ -509,13 +534,13 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
   const byCategory = db.prepare(`
     SELECT
       CASE
-        WHEN error LIKE '%429%' OR error LIKE '%rate limit%' OR error LIKE '%too many%' OR error LIKE '%quota%' THEN 'Rate Limited (429)'
-        WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid.*key%' THEN 'Auth Error (401)'
-        WHEN error LIKE '%403%' OR error LIKE '%forbidden%' THEN 'Forbidden (403)'
-        WHEN error LIKE '%404%' OR error LIKE '%not found%' THEN 'Not Found (404)'
-        WHEN error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
-        WHEN error LIKE '%500%' OR error LIKE '%internal server%' THEN 'Server Error (500)'
-        WHEN error LIKE '%503%' OR error LIKE '%unavailable%' THEN 'Unavailable (503)'
+        WHEN lower(error) LIKE '%429%' OR lower(error) LIKE '%rate limit%' OR lower(error) LIKE '%too many%' OR lower(error) LIKE '%quota%' THEN 'Rate Limited (429)'
+        WHEN lower(error) LIKE '%401%' OR lower(error) LIKE '%unauthorized%' OR lower(error) LIKE '%invalid api key%' OR lower(error) LIKE '%invalid_api_key%' OR lower(error) LIKE '%incorrect api key%' THEN 'Auth Error (401)'
+        WHEN lower(error) LIKE '%403%' OR lower(error) LIKE '%forbidden%' THEN 'Forbidden (403)'
+        WHEN lower(error) LIKE '%404%' OR lower(error) LIKE '%not found%' THEN 'Not Found (404)'
+        WHEN lower(error) LIKE '%timeout%' OR lower(error) LIKE '%timed out%' OR lower(error) LIKE '%etimedout%' OR lower(error) LIKE '%econnrefused%' THEN 'Timeout/Connection'
+        WHEN lower(error) LIKE '%500%' OR lower(error) LIKE '%internal server%' THEN 'Server Error (500)'
+        WHEN lower(error) LIKE '%503%' OR lower(error) LIKE '%unavailable%' THEN 'Unavailable (503)'
         ELSE 'Other'
       END as category,
       COUNT(*) as count
@@ -600,9 +625,11 @@ analyticsRouter.get('/requests', (req: Request, res: Response) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit as string, 10) || 100, 1), 500);
   const offset = Math.max(parseInt(req.query.offset as string, 10) || 0, 0);
 
-  // Optional filters. All are validated (whitelist / shape) and applied as
-  // bound parameters; absent filters keep the default behavior identical.
-  const status = req.query.status as string | undefined;
+  // First value only, like routes/logs.ts: Express hands back an ARRAY for a
+  // repeated query param, and the provider shape check below dies on
+  // `provider.startsWith(...)` — arrays have no such method — turning a client
+  // bug into a 500 on the dashboard's recent-calls panel.
+  const status = firstParam(req.query.status);
   if (status !== undefined && status !== 'success' && status !== 'error' && status !== 'canceled') {
     res.status(400).json({ error: "invalid status filter (expected 'success', 'error' or 'canceled')" });
     return;
@@ -613,8 +640,8 @@ analyticsRouter.get('/requests', (req: Request, res: Response) => {
   // endpoint's base_url is what actually selects one). The legacy `platform`
   // param still works for old clients. Both are bound parameters, never
   // interpolated, so the only validation needed is shape.
-  const provider = req.query.provider as string | undefined;
-  const platform = req.query.platform as string | undefined;
+  const provider = firstParam(req.query.provider);
+  const platform = firstParam(req.query.platform);
   let providerFilterSql = '';
   const providerFilterParams: string[] = [];
   if (provider !== undefined) {

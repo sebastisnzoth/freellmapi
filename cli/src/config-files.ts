@@ -7,7 +7,7 @@ import {
   type ParseError,
 } from 'jsonc-parser';
 import { Document, isMap, parseDocument } from 'yaml';
-import type { GeneratedFile } from './types.js';
+import type { GeneratedFile, JsonArrayMerge } from './types.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value)
@@ -15,7 +15,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     && !Array.isArray(value);
 }
 
-function mergeJson(existing: string, value: Record<string, unknown>): string {
+function mergeJsonArray(current: unknown[], next: unknown[], rule: JsonArrayMerge): unknown[] {
+  if ('union' in rule) {
+    return [...current, ...next.filter(item => !current.some(existing => JSON.stringify(existing) === JSON.stringify(item)))];
+  }
+  const owned = (item: unknown) => isRecord(item)
+    && Object.entries(rule.ownedBy).every(([field, expected]) => item[field] === expected);
+  return [...current.filter(item => !owned(item)), ...next];
+}
+
+function mergeJson(existing: string, value: Record<string, unknown>, arrays: Record<string, JsonArrayMerge> = {}): string {
   let rendered = existing.trim() ? existing : '{}\n';
   const errors: ParseError[] = [];
   const parsed = parse(rendered, errors, {
@@ -43,10 +52,14 @@ function mergeJson(existing: string, value: Record<string, unknown>): string {
         applyPatch(current, next, propertyPath);
         continue;
       }
+      const arrayRule = arrays[propertyPath.join('.')];
+      const merged = arrayRule && Array.isArray(current) && Array.isArray(next)
+        ? mergeJsonArray(current, next, arrayRule)
+        : next;
       rendered = applyEdits(rendered, modify(
         rendered,
         propertyPath,
-        next,
+        merged,
         { formattingOptions },
       ));
     }
@@ -205,6 +218,36 @@ function tomlTableHeader(line: string): string | undefined {
   return line.match(/^\[([^\]]+)\]$/)?.[1];
 }
 
+function tomlArrayHeader(line: string): string | undefined {
+  return line.match(/^\[\[([^\]]+)\]\]$/)?.[1];
+}
+
+function isTomlHeader(line: string): boolean {
+  return tomlTableHeader(line) !== undefined || tomlArrayHeader(line) !== undefined;
+}
+
+// An array-of-tables entry (`[[providers]]`) has no name of its own; the
+// `name = "..."` key inside it is what tools use to tell entries apart.
+function tomlEntryName(lines: string[]): string | undefined {
+  for (const line of lines.slice(1)) {
+    if (isTomlHeader(line)) break;
+    const value = line.match(/^\s*name\s*=\s*(?:"([^"]*)"|'([^']*)')/);
+    if (value) return value[1] ?? value[2];
+  }
+  return undefined;
+}
+
+// Splits a document into its root region and one block per header, each block
+// running up to the next header.
+function tomlBlocks(lines: string[]): string[][] {
+  const blocks: string[][] = [[]];
+  for (const line of lines) {
+    if (isTomlHeader(line)) blocks.push([]);
+    blocks[blocks.length - 1].push(line);
+  }
+  return blocks;
+}
+
 function tomlRootKey(line: string): string | undefined {
   return line.match(/^([A-Za-z0-9_.-]+)\s*=/)?.[1];
 }
@@ -228,7 +271,7 @@ interface TomlSections {
 
 function splitTomlSections(generated: string): TomlSections {
   const lines = generated.split(/\r?\n/).filter(line => !isTomlMarkerLine(line));
-  const firstTable = lines.findIndex(line => tomlTableHeader(line) !== undefined);
+  const firstTable = lines.findIndex(isTomlHeader);
   if (firstTable < 0) return { root: trimBlankEdges(lines), tables: [] };
   return {
     root: trimBlankEdges(lines.slice(0, firstTable)),
@@ -240,7 +283,10 @@ function splitTomlSections(generated: string): TomlSections {
 // generated root-level keys must be inserted BEFORE the first table header of
 // the existing file, never appended after it. Generated tables are appended at
 // the end, and only root keys that the generated ROOT REGION sets are removed
-// from the existing root region.
+// from the existing root region. An existing `[[array]]` entry is replaced only
+// when a generated entry of the same array carries the same `name` — together
+// with the `[array.sub]` tables that belong to it — so the user's other entries
+// in that array stay put.
 function mergeToml(existing: string, generated: string): string {
   if (!existing.trim()) return generated;
   const { root: generatedRoot, tables: generatedTables } = splitTomlSections(generated);
@@ -250,22 +296,34 @@ function mergeToml(existing: string, generated: string): string {
   const tableNames = new Set(generatedTables
     .map(tomlTableHeader)
     .filter((name): name is string => Boolean(name)));
+  const arrayEntries = new Set(tomlBlocks(generatedTables)
+    .filter(block => block.length && tomlArrayHeader(block[0]))
+    .map(block => `${tomlArrayHeader(block[0])}\0${tomlEntryName(block)}`));
 
   const kept: string[] = [];
-  let currentTable: string | undefined;
-  for (const line of existing.split(/\r?\n/)) {
-    if (isTomlMarkerLine(line)) continue;
-    const table = tomlTableHeader(line);
-    if (table) currentTable = table;
-    if (currentTable && tableNames.has(currentTable)) continue;
-    if (!currentTable && rootKeys.has(tomlRootKey(line) ?? '')) continue;
-    kept.push(line);
+  let droppedArray: string | undefined;
+  const [existingRoot, ...existingBlocks] = tomlBlocks(
+    existing.split(/\r?\n/).filter(line => !isTomlMarkerLine(line)),
+  );
+  kept.push(...existingRoot.filter(line => !rootKeys.has(tomlRootKey(line) ?? '')));
+  for (const block of existingBlocks) {
+    const table = tomlTableHeader(block[0]);
+    const array = tomlArrayHeader(block[0]);
+    const name = table ?? array ?? '';
+    if (droppedArray && name.startsWith(`${droppedArray}.`)) continue;
+    droppedArray = undefined;
+    if (table && tableNames.has(table)) continue;
+    if (array && arrayEntries.has(`${array}\0${tomlEntryName(block)}`)) {
+      droppedArray = array;
+      continue;
+    }
+    kept.push(...block);
   }
 
   const wrap = (lines: string[]): string[] => (lines.length
     ? ['# freellmapi:start', ...lines, '# freellmapi:end']
     : []);
-  const firstTable = kept.findIndex(line => tomlTableHeader(line) !== undefined);
+  const firstTable = kept.findIndex(isTomlHeader);
   const head = firstTable < 0 ? kept : kept.slice(0, firstTable);
   const tail = firstTable < 0 ? [] : kept.slice(firstTable);
   const sections = [head, wrap(generatedRoot), tail, wrap(generatedTables)]
@@ -282,7 +340,8 @@ function mergeEnv(existing: string, generated: string): string {
   );
   // An absent or empty file has no lines: splitting '' yields [''] and that
   // empty line survived as a blank first line in every freshly written .env.
-  const lines = existing.trim() ? existing.split(/\r?\n/) : [];
+  // Trailing blank lines go too, or an appended key lands after a gap.
+  const lines = existing.trim() ? existing.replace(/(?:\r?\n)+$/, '').split(/\r?\n/) : [];
   const seen = new Set<string>();
   const output = lines.map(line => {
     const separator = line.indexOf('=');
@@ -300,7 +359,7 @@ function mergeEnv(existing: string, generated: string): string {
 }
 
 export function renderFile(file: GeneratedFile, existing = ''): string {
-  if (file.format === 'json') return mergeJson(existing, file.value ?? {});
+  if (file.format === 'json') return mergeJson(existing, file.value ?? {}, file.arrays);
   if (file.format === 'env') return mergeEnv(existing, file.content ?? '');
   if (file.format === 'yaml') {
     return file.value

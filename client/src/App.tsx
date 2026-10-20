@@ -1,7 +1,7 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Link, useLocation, useNavigate } from 'react-router-dom'
 import { MutationCache, QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { ChevronDown, KeyRound, LogOut, Menu, MoreHorizontal, Search, Settings, Sparkles } from 'lucide-react'
+import { ChevronDown, KeyRound, LogOut, Menu, MoreHorizontal, RefreshCw, Search, Settings, Sparkles } from 'lucide-react'
 import { buttonVariants } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -19,8 +19,11 @@ import { CommandPalette } from '@/components/command-palette'
 import { openCommandPalette } from '@/components/command-palette-state'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { SettingsDialog } from '@/components/settings-dialog'
+import { UpdatesDialog } from '@/components/updates-dialog'
+import { OPEN_UPDATES_EVENT } from '@/lib/updates'
 import { Toaster } from '@/components/toaster'
 import { UpdateReminder } from '@/components/update-reminder'
+import { NewBuildPrompt } from '@/components/new-build-prompt'
 import { usePremium } from '@/hooks/use-premium'
 import { I18nProvider, useI18n } from '@/i18n'
 import { logout } from '@/lib/api'
@@ -35,6 +38,8 @@ import EmbeddingsPage from '@/pages/EmbeddingsPage'
 import ImagePage from '@/pages/ImagePage'
 import VideoPage from '@/pages/VideoPage'
 import AudioPage from '@/pages/AudioPage'
+import SearchPage from '@/pages/SearchPage'
+import DecisionPage from '@/pages/DecisionPage'
 import MediaDetailPage from '@/pages/MediaDetailPage'
 import EmbeddingDetailPage from '@/pages/EmbeddingDetailPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
@@ -78,10 +83,12 @@ const navItems = [
 // first landing on the chat table.
 const modelItems = [
   { to: '/models/chat', labelKey: 'models.chatModelsTab' },
-  { to: '/models/embeddings', labelKey: 'models.embeddingsTab' },
   { to: '/models/image', labelKey: 'models.imageTab' },
   { to: '/models/video', labelKey: 'models.videoTab' },
   { to: '/models/audio', labelKey: 'models.audioTab' },
+  { to: '/models/embeddings', labelKey: 'models.embeddingsTab' },
+  { to: '/models/decision', labelKey: 'decision.tab' },
+  { to: '/models/search', labelKey: 'search.tab' },
   { to: '/models/fusion', labelKey: 'models.fusionTab' },
 ]
 
@@ -169,22 +176,26 @@ function AccountMenuItems({
   showUpgrade,
   upgradeLabel,
   settingsLabel,
+  updatesLabel,
   signOutLabel,
   changeEmailLabel,
   changePasswordLabel,
   onUpgrade,
   onOpenSettings,
+  onOpenUpdates,
   onChangeEmail,
   onChangePassword,
 }: {
   showUpgrade: boolean
   upgradeLabel: string
   settingsLabel: string
+  updatesLabel: string
   signOutLabel: string
   changeEmailLabel: string
   changePasswordLabel: string
   onUpgrade: () => void
   onOpenSettings: () => void
+  onOpenUpdates: () => void
   onChangeEmail: () => void
   onChangePassword: () => void
 }) {
@@ -199,6 +210,10 @@ function AccountMenuItems({
       <DropdownMenuItem onClick={onOpenSettings}>
         <Settings />
         {settingsLabel}
+      </DropdownMenuItem>
+      <DropdownMenuItem onClick={onOpenUpdates}>
+        <RefreshCw />
+        {updatesLabel}
       </DropdownMenuItem>
       {/* Desktop signs in with a hidden local account, so it has no credentials
           to change and no session to end. */}
@@ -228,6 +243,13 @@ function Navbar() {
   const location = useLocation()
   const navigate = useNavigate()
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [updatesOpen, setUpdatesOpen] = useState(false)
+  // The update pill lives outside the navbar; it asks for this dialog by event.
+  useEffect(() => {
+    const open = () => setUpdatesOpen(true)
+    window.addEventListener(OPEN_UPDATES_EVENT, open)
+    return () => window.removeEventListener(OPEN_UPDATES_EVENT, open)
+  }, [])
   const [credentialsMode, setCredentialsMode] = useState<'password' | 'email' | null>(null)
   const { data: premium, licensed, isLoading: premiumLoading, isError: premiumError } = usePremium()
   const showUpgrade = Boolean(premium) && !licensed && !premiumLoading && !premiumError
@@ -307,11 +329,13 @@ function Navbar() {
                   showUpgrade={showUpgrade}
                   upgradeLabel={t('nav.upgrade')}
                   settingsLabel={t('nav.settings')}
+                  updatesLabel={t('settings.checkForUpdates')}
                   signOutLabel={t('nav.signOut')}
                   changeEmailLabel={t('auth.changeEmail')}
                   changePasswordLabel={t('auth.changePassword')}
                   onUpgrade={() => navigate('/premium')}
                   onOpenSettings={() => setSettingsOpen(true)}
+                  onOpenUpdates={() => setUpdatesOpen(true)}
                   onChangeEmail={() => setCredentialsMode('email')}
                   onChangePassword={() => setCredentialsMode('password')}
                 />
@@ -361,11 +385,13 @@ function Navbar() {
                   showUpgrade={showUpgrade}
                   upgradeLabel={t('nav.upgrade')}
                   settingsLabel={t('nav.settings')}
+                  updatesLabel={t('settings.checkForUpdates')}
                   signOutLabel={t('nav.signOut')}
                   changeEmailLabel={t('auth.changeEmail')}
                   changePasswordLabel={t('auth.changePassword')}
                   onUpgrade={() => navigate('/premium')}
                   onOpenSettings={() => setSettingsOpen(true)}
+                  onOpenUpdates={() => setUpdatesOpen(true)}
                   onChangeEmail={() => setCredentialsMode('email')}
                   onChangePassword={() => setCredentialsMode('password')}
                 />
@@ -375,6 +401,7 @@ function Navbar() {
         </div>
       </header>
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      <UpdatesDialog open={updatesOpen} onOpenChange={setUpdatesOpen} />
       {credentialsMode && (
         <ChangeCredentialsModal mode={credentialsMode} onClose={() => setCredentialsMode(null)} />
       )}
@@ -464,6 +491,8 @@ function App() {
                       <Route path="/models/audio" element={<AudioPage />} />
                       <Route path="/models/audio/:id" element={<MediaDetailPage modality="audio" />} />
                       <Route path="/models/transcription/:id" element={<MediaDetailPage modality="transcription" />} />
+                      <Route path="/models/search" element={<SearchPage />} />
+                      <Route path="/models/decision" element={<DecisionPage />} />
                       <Route path="/playground" element={<PlaygroundPage />} />
                       <Route path="/keys" element={<KeysPage />} />
                       <Route path="/agents" element={<AgentsPage />} />
@@ -480,6 +509,7 @@ function App() {
                 <Toaster />
                 <CommandPalette />
                 <UpdateReminder />
+                <NewBuildPrompt />
               </AppShell>
             </AuthGate>
           </BrowserRouter>

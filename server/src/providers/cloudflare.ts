@@ -5,7 +5,7 @@ import type {
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult, type KeyValidationFailure } from './base.js';
 import { extendedBodyParams, resolveMaxTokens } from '../lib/sampling-params.js';
-import { contentToString } from '../lib/content.js';
+import { contentToString, contentHasImage } from '../lib/content.js';
 import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
@@ -46,7 +46,12 @@ export class CloudflareProvider extends BaseProvider {
   //     even though the OpenAI spec allows it (collapse to '');
   //   - doesn't accept the array content envelope, so flatten to string.
   private normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
-    return messages.map(m => ({ ...m, content: contentToString(m.content) }));
+    return messages.map(m => ({
+      ...m,
+      content: m.role === 'user' && contentHasImage(m.content)
+        ? m.content
+        : contentToString(m.content),
+    }));
   }
 
   async chatCompletion(
@@ -69,7 +74,7 @@ export class CloudflareProvider extends BaseProvider {
         model: modelId,
         messages: this.normalizeMessages(messages),
         temperature: options?.temperature,
-        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens, options?.contextBudget),
         top_p: options?.top_p,
         stop: options?.stop,
         tools: options?.tools,
@@ -125,7 +130,7 @@ export class CloudflareProvider extends BaseProvider {
         model: modelId,
         messages: this.normalizeMessages(messages),
         temperature: options?.temperature,
-        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens, options?.contextBudget),
         top_p: options?.top_p,
         stop: options?.stop,
         tools: options?.tools,

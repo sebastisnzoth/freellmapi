@@ -90,11 +90,6 @@ function modelRowValue(row: Record<string, unknown> | undefined, key: keyof Mode
   return value ?? null;
 }
 
-export function routableContextWindow(platform: string, modelId: string, contextWindow: number | null): number | null {
-  if (platform === 'github' && modelId === 'openai/gpt-4.1') return 8000;
-  return contextWindow;
-}
-
 function cachedCatalogDefaults(db: Db, platform: string, modelId: string): StoredOverrides {
   const row = db.prepare("SELECT value FROM settings WHERE key = 'catalog_applied_json'").get() as { value: string } | undefined;
   if (!row) return {};
@@ -108,7 +103,7 @@ function cachedCatalogDefaults(db: Db, platform: string, modelId: string): Store
       rpmLimit: model.limits.rpm, rpdLimit: model.limits.rpd,
       tpmLimit: model.limits.tpm, tpdLimit: model.limits.tpd,
       monthlyTokenBudget: model.monthlyTokenBudget ?? '',
-      contextWindow: routableContextWindow(platform, modelId, model.contextWindow),
+      contextWindow: model.contextWindow,
       supportsVision: model.supportsVision, supportsTools: model.supportsTools,
       enabled: model.enabled,
     };
@@ -143,7 +138,10 @@ export function overriddenFieldNames(overridesJson: string | null | undefined): 
 }
 
 export function isCatalogManagedModel(row: { platform: string; key_id?: number | null; source?: string }): boolean {
-  // `source` is the authoritative provenance (models.source, 'catalog'|'user');
+  // `source` is the authoritative provenance (models.source: 'catalog', 'user'
+  // or 'discovered'). Discovered rows on built-in platforms (#1348) count as
+  // catalog-managed: deleting one records a catalog tombstone, which both
+  // discovery and a later catalog honor;
   // callers that select it get an exact answer. The platform/key_id fallback
   // covers callers that don't have the column in hand.
   if (row.source === 'user') return false;

@@ -3,24 +3,43 @@ import type { BaseProvider } from './base.js';
 import { GoogleProvider } from './google.js';
 import { OpenAICompatProvider } from './openai-compat.js';
 import { CohereProvider } from './cohere.js';
+import { TavilyProvider } from './tavily.js';
+import { ExaProvider } from './exa.js';
+import { FirecrawlProvider } from './firecrawl.js';
+import { LinkupProvider } from './linkup.js';
+import { ParallelProvider } from './parallel.js';
 import { CloudflareProvider } from './cloudflare.js';
 import { AIHordeProvider } from './aihorde.js';
 import { ModelScopeProvider } from './modelscope.js';
 import { PollinationsProvider } from './pollinations.js';
 import { ZhipuProvider } from './zhipu.js';
 import { SailProvider } from './sail.js';
+import { AclideProvider } from './aclide.js';
+import { SpekaProvider } from './speka.js';
+import { TyphoonProvider } from './typhoon.js';
+import { PlugskyProvider } from './plugsky.js';
+import { InferbaseProvider } from './inferbase.js';
+import { SimpleLLMProvider } from './simplellm.js';
+import { LlmtrProvider } from './llmtr.js';
+import { GizmoProvider } from './gizmo.js';
+import { BlockRunProvider } from './blockrun.js';
+import { MoondreamProvider } from './moondream.js';
 import { ElectronHubProvider } from './electronhub.js';
 import { ExperientialProvider } from './experiential.js';
 import { Router9Provider } from './router9.js';
 import { SeptorProvider } from './septor.js';
 import { ClodProvider } from './clod.js';
 import { SpeechifyProvider } from './speechify.js';
+import { FreeAiProvider } from './freeai.js';
 import { BlazeProvider } from './blaze.js';
 import { LucidityProvider } from './lucidity.js';
 import { AirforceProvider } from './airforce.js';
 import { DreamPromptingProvider } from './dreamprompting.js';
 import { WaterfallProvider } from './waterfall.js';
 import { LogfareProvider } from './logfare.js';
+import { BeatApiProvider } from './beatapi.js';
+import { ApinexProvider } from './apinex.js';
+import { SerpSearchProvider } from './serpsearch.js';
 
 const providers = new Map<Platform, BaseProvider>();
 
@@ -54,6 +73,19 @@ register(new OpenAICompatProvider({
 // usage beyond that grant is pay-as-you-go. Live-tested 2026-09-01. Model rows
 // stay in Oracle so the existing Premium-now / Free-after-30-days gate applies.
 register(new SailProvider());
+register(new AclideProvider());
+register(new SpekaProvider());
+register(new TyphoonProvider());
+register(new PlugskyProvider());
+register(new InferbaseProvider());
+register(new SimpleLLMProvider());
+register(new LlmtrProvider());
+register(new GizmoProvider());
+register(new BlockRunProvider());
+register(new MoondreamProvider());
+register(new BeatApiProvider());
+register(new ApinexProvider());
+register(new SerpSearchProvider());
 
 // Free-plan grants are shared wallets, not free credits per model. Eligibility
 // and tested model rows belong in Oracle, never in bundled DB migrations.
@@ -66,6 +98,7 @@ register(new Router9Provider());
 register(new SeptorProvider());
 register(new ClodProvider());
 register(new SpeechifyProvider());
+register(new FreeAiProvider());
 register(new BlazeProvider());
 // Five more OpenAI-compatible gateways. Each pins the response model to the
 // requested route (502 on substitution); rows stay in the hosted catalog.
@@ -154,19 +187,35 @@ register(new OpenAICompatProvider({
     'HTTP-Referer': 'http://localhost:3001',
     'X-Title': 'FreeLLMAPI',
   },
+  // #1403: OpenRouter reports the key's real credit balance and hard limit on
+  // its key-info endpoint (outside /api/v1). limit/remaining are USD amounts
+  // when set; null means the key is on the free tier with no credit cap, so
+  // the probe records whatever pair the endpoint actually fills.
+  quotaProbe: {
+    url: 'https://openrouter.ai/api/v1/key',
+    metric: 'credits',
+    limitFields: ['limit'],
+    remainingFields: ['limit_remaining'],
+    notes: 'openrouter key-info: USD credit (limit/limit_remaining)',
+  },
 }));
 
-// GitHub Models — OpenAI-compatible. Catalog uses `<publisher>/<model>` ids
-// (e.g. `openai/gpt-4.1`); the old Azure endpoint rejects that prefix with
-// "Unknown model", so route to the current models.github.ai endpoint.
-register(new OpenAICompatProvider({
-  platform: 'github',
-  name: 'GitHub Models',
-  baseUrl: 'https://models.github.ai/inference',
-}));
+// GitHub Models was retired upstream on 30 July 2026 (#549): models.github.ai
+// now answers every request with 200 "OK" in plain text, so a registered
+// adapter only produced fake-healthy keys and broken streams (#1557). The
+// provider is gone; migration 20261017_000002 removes leftover rows.
 
 // Cohere - OpenAI-compatible via Cohere compatibility endpoint
 register(new CohereProvider());
+// Web search APIs (#1174). They serve /v1/search and the agents' web_search
+// tools, never chat (see providers/search-only.ts); they are registered so
+// their keys can be added and health-checked like every platform.
+register(new TavilyProvider());
+register(new ExaProvider());
+register(new FirecrawlProvider());
+register(new LinkupProvider());
+// Keyless: anonymous Search MCP by default, REST API with a real key.
+register(new ParallelProvider());
 
 // Cloudflare Workers AI - OpenAI-compatible endpoint (key = "account_id:token")
 register(new CloudflareProvider());
@@ -333,6 +382,18 @@ register(new OpenAICompatProvider({
   platform: 'siliconflow',
   name: 'SiliconFlow',
   baseUrl: 'https://api.siliconflow.com/v1',
+  // #1403: SiliconFlow reports the account's credit balance on
+  // GET /v1/user/info (data.balance = gift credit, data.totalBalance = gift +
+  // charge; values arrive as numeric strings in CNY). There is no limit field,
+  // so the probe records remaining only — a real number beats parseBudget's 0
+  // for this pool.
+  quotaProbe: {
+    url: 'https://api.siliconflow.com/v1/user/info',
+    metric: 'credits',
+    limitFields: [],
+    remainingFields: ['totalBalance', 'balance'],
+    notes: 'siliconflow user-info: CNY credit balance (totalBalance)',
+  },
 }));
 
 // Routeway — OpenAI-compatible aggregator (api.routeway.ai/v1). Free models

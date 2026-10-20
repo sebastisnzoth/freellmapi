@@ -8,11 +8,19 @@
 // always works: with one provider it just uses that one, with several it gets
 // cross-provider redundancy for free.
 import { getDb, getSetting } from '../db/index.js';
+import { secondsUntilNextMonth } from './key-budget.js';
+import { parseRetryAfterMs } from '../providers/base.js';
+import { RetryHintTracker, retryAfterSeconds } from '../lib/retry-hint.js';
 import { getClientContext } from '../lib/client-context.js';
 import { reserveProviderCredential } from './provider-credential.js';
 import { proxyFetch } from '../lib/proxy.js';
+import { bearerAuthHeader } from '../lib/credential.js';
 import { customEndpointKeyIds } from './custom-endpoint.js';
 import type { Db } from '../db/types.js';
+import { SPEKA_BASE_URL } from '../providers/speka.js';
+import { ELECTRONHUB_BASE_URL } from '../providers/electronhub.js';
+import { INFERBASE_BASE_URL } from '../providers/inferbase.js';
+import { LLMTR_BASE_URL } from '../providers/llmtr.js';
 
 export interface EmbeddingModelRow {
   id: number;
@@ -40,11 +48,30 @@ export interface EmbeddingsResult {
 export class EmbeddingsError extends Error {
   status: number;
   code?: string;
-  constructor(message: string, status: number, code?: string) {
+  /** Back-off the upstream provider stated (`Retry-After` header or a
+   *  retry-delay field in the error body), in milliseconds. Kept separate from
+   *  the message so the route can answer the client with a real Retry-After
+   *  instead of a bare 429, the same way the chat router benches keys. */
+  retryAfterMs?: number;
+  constructor(message: string, status: number, code?: string, retryAfterMs?: number) {
     super(message);
     this.status = status;
     this.code = code;
+    this.retryAfterMs = retryAfterMs;
   }
+}
+
+/** EmbeddingsError for a non-OK upstream response: status, truncated body and
+ *  any stated back-off read off the `Retry-After` header before the body is
+ *  consumed. */
+async function upstreamEmbeddingsError(r: Response): Promise<EmbeddingsError> {
+  const retryAfterMs = parseRetryAfterMs(r.headers?.get('retry-after') ?? null);
+  return new EmbeddingsError(
+    `upstream ${r.status}: ${(await r.text()).slice(0, 200)}`,
+    r.status,
+    undefined,
+    retryAfterMs,
+  );
 }
 
 export function listEmbeddingModels(): EmbeddingModelRow[] {
@@ -85,11 +112,14 @@ export const EMBEDDING_PLATFORMS = new Set([
   'google',
   'nvidia',
   'openrouter',
-  'github',
   'cloudflare',
   'huggingface',
   'cohere',
   'sealion',
+  'speka',
+  'electronhub',
+  'inferbase',
+  'llmtr',
 ]);
 
 interface ProviderCallResult {
@@ -105,6 +135,8 @@ async function openAiStyleEmbed(
   inputs: string[],
   extra: Record<string, unknown> = {},
   dimensions?: number,
+  expectedDimensions?: number,
+  timeoutMs = FETCH_TIMEOUT_MS,
 ): Promise<ProviderCallResult> {
   const body: Record<string, unknown> = { model: modelId, input: inputs, ...extra };
   // Some providers (NVIDIA NeMo NIM, Google Gemini Embedding, OpenAI v3) support
@@ -116,18 +148,32 @@ async function openAiStyleEmbed(
   if (dimensions !== undefined) body.dimensions = dimensions;
   const r = await proxyFetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    // A custom endpoint with auth off holds the `no-key` sentinel: omit the
+    // header instead of sending `Bearer no-key` (#1331).
+    headers: { 'Content-Type': 'application/json', ...bearerAuthHeader(key) },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  }, platform, 'embedding', FETCH_TIMEOUT_MS);
+    signal: AbortSignal.timeout(timeoutMs),
+  }, platform, 'embedding', timeoutMs);
   if (!r.ok) {
-    throw new EmbeddingsError(`upstream ${r.status}: ${(await r.text()).slice(0, 200)}`, r.status);
+    throw await upstreamEmbeddingsError(r);
   }
   const j = (await r.json()) as {
+    model?: string;
     data?: { index?: number; embedding: number[] }[];
     usage?: { prompt_tokens?: number; total_tokens?: number };
   };
   const data = [...(j.data ?? [])].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  if (['electronhub', 'inferbase', 'llmtr'].includes(platform) && (
+    j.model !== modelId || data.length !== inputs.length ||
+    data.some((d, i) => d.index !== i || !Array.isArray(d.embedding) ||
+      d.embedding.length !== (dimensions ?? expectedDimensions) ||
+      d.embedding.some(value => typeof value !== 'number' || !Number.isFinite(value)))
+  )) {
+    // A successful HTTP response is not enough: wrong model/dimension or
+    // malformed vectors would corrupt the caller's embedding family.
+    const provider = platform === 'electronhub' ? 'ElectronHub' : platform === 'llmtr' ? 'LLMTR' : 'Inferbase';
+    throw new EmbeddingsError(`${provider} returned mismatched or malformed embeddings`, 502);
+  }
   return {
     vectors: data.map(d => d.embedding),
     inputTokens: j.usage?.prompt_tokens ?? j.usage?.total_tokens ?? null,
@@ -234,10 +280,21 @@ async function callProvider(row: EmbeddingModelRow, credential: ProviderCredenti
       return openAiStyleEmbed('https://integrate.api.nvidia.com/v1/embeddings', row.platform, key, row.model_id, inputs, { input_type: 'query' }, dimensions);
     case 'openrouter':
       return openAiStyleEmbed('https://openrouter.ai/api/v1/embeddings', row.platform, key, row.model_id, inputs, {}, dimensions);
-    case 'github':
-      return openAiStyleEmbed('https://models.github.ai/inference/embeddings', row.platform, key, row.model_id, inputs, {}, dimensions);
     case 'sealion':
       return openAiStyleEmbed('https://api.sea-lion.ai/v1/embeddings', row.platform, key, row.model_id, inputs, {}, dimensions);
+    case 'speka':
+      return openAiStyleEmbed(`${SPEKA_BASE_URL}/embeddings`, row.platform, key, row.model_id, inputs, { encoding_format: 'float' }, dimensions);
+    case 'electronhub':
+      return openAiStyleEmbed(`${ELECTRONHUB_BASE_URL}/embeddings`, row.platform, key, row.model_id, inputs, { encoding_format: 'float' }, dimensions, row.dimensions);
+    case 'inferbase':
+      return openAiStyleEmbed(`${INFERBASE_BASE_URL}/embeddings`, row.platform, key, row.model_id, inputs, { encoding_format: 'float' }, dimensions, row.dimensions);
+    case 'llmtr':
+      // The catalog-approved models return fixed-width vectors. Do not send a
+      // dimension override or accept a substituted model/embedding space.
+      if (dimensions !== undefined && dimensions !== row.dimensions) {
+        throw new EmbeddingsError('LLMTR does not support an embedding dimension override', 400);
+      }
+      return openAiStyleEmbed(`${LLMTR_BASE_URL}/embeddings`, row.platform, key, row.model_id, inputs, {}, undefined, row.dimensions);
     case 'cloudflare': {
       // Key is stored as "account_id:token".
       const sep = key.indexOf(':');
@@ -261,7 +318,7 @@ async function callProvider(row: EmbeddingModelRow, credential: ProviderCredenti
         },
         row.platform, 'embedding', FETCH_TIMEOUT_MS,
       );
-      if (!r.ok) throw new EmbeddingsError(`upstream ${r.status}: ${(await r.text()).slice(0, 200)}`, r.status);
+      if (!r.ok) throw await upstreamEmbeddingsError(r);
       const j = await r.json() as number[][] | number[];
       const vectors = Array.isArray(j[0]) ? (j as number[][]) : [j as number[]];
       return { vectors, inputTokens: null };
@@ -278,7 +335,7 @@ async function callProvider(row: EmbeddingModelRow, credential: ProviderCredenti
         }),
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       }, row.platform, 'embedding', FETCH_TIMEOUT_MS);
-      if (!r.ok) throw new EmbeddingsError(`upstream ${r.status}: ${(await r.text()).slice(0, 200)}`, r.status);
+      if (!r.ok) throw await upstreamEmbeddingsError(r);
       const j = (await r.json()) as { embeddings?: { float?: number[][] }; meta?: { billed_units?: { input_tokens?: number } } };
       return { vectors: j.embeddings?.float ?? [], inputTokens: j.meta?.billed_units?.input_tokens ?? null };
     }
@@ -331,10 +388,16 @@ export async function runEmbeddings(model: string | undefined, inputs: string[],
   }
 
   let lastError: EmbeddingsError | null = null;
+  // Upstream back-offs across the whole chain: only a chain that was rate
+  // limited end to end earns a Retry-After, and then the soonest one.
+  const hints = new RetryHintTracker();
   for (const row of chain) {
     const { credential, budgetBlocked } = reserveProviderCredential(row, estimateTokens(inputs));
     if (!credential) {
-      if (budgetBlocked) lastError = new EmbeddingsError('Monthly key budget exhausted', 429, 'quota_exceeded');
+      if (budgetBlocked) {
+        lastError = new EmbeddingsError('Monthly key budget exhausted', 429, 'quota_exceeded');
+        hints.record(429, secondsUntilNextMonth() * 1000);
+      }
       continue;
     }
     const started = Date.now();
@@ -357,6 +420,7 @@ export async function runEmbeddings(model: string | undefined, inputs: string[],
       const e = err instanceof EmbeddingsError ? err : new EmbeddingsError(String(err?.message ?? err), 502);
       logEmbeddingRequest(row, credential.id, 'error', 0, Date.now() - started, e.message.slice(0, 300));
       lastError = e;
+      hints.record(e.status, e.retryAfterMs);
       // fall through to the next provider in the family
     } finally {
       credential.release();
@@ -367,5 +431,16 @@ export async function runEmbeddings(model: string | undefined, inputs: string[],
     `All providers for embedding family '${family}' failed${lastError ? ` (last: ${lastError.message.slice(0, 160)})` : ' (no usable keys)'}.`,
     lastError && lastError.status === 429 ? 429 : 502,
     lastError?.code,
+    lastError && lastError.status === 429 ? hints.retryAfterMs() : undefined,
   );
+}
+
+/** Whole seconds the client should wait before retrying an embeddings request:
+ *  the soonest upstream back-off when the whole chain was rate limited, else the
+ *  monthly-budget reset for a local quota block. Undefined means the caller
+ *  shouldn't set the header. */
+export function embeddingsRetryAfterSec(err: EmbeddingsError): number | undefined {
+  if (err.retryAfterMs !== undefined) return retryAfterSeconds(err.retryAfterMs);
+  if (err.code === 'quota_exceeded') return secondsUntilNextMonth();
+  return undefined;
 }
