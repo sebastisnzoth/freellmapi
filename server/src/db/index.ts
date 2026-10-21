@@ -223,6 +223,12 @@ export function initDb(
 }
 
 export function getUnifiedApiKey(): string {
+  // Optional deploy-only inference key. Keep it in Render's secret env and
+  // GitHub Actions secrets, not in source or the SQLite backup.
+  const configured = process.env.FREEAPI_UNIFIED_API_KEY;
+  if (configured && /^freellmapi-[a-f0-9]{64}$/.test(configured)) {
+    return configured;
+  }
   const db = getDb();
   const row = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string };
   return row.value;
