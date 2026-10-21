@@ -85,6 +85,48 @@ async function main() {
     startDbBackupPump(getDb(), scheduler, config.dbPath ?? undefined);
     startBackupScheduler(scheduler);
     startCustomModelSync(getDb(), scheduler);
+    // Explicitly opted-in, one-shot end-to-end inference smoke check.
+    // Credentials never leave server memory or appear in logs.
+    if (process.env.FREEAPI_HIVE_SMOKE_TEST === 'true') {
+      void (async () => {
+        const hive = process.env.FREEAPI_HIVE_TOKEN ?? '';
+        const key = process.env.FREEAPI_UNIFIED_API_KEY ?? '';
+        if (hive.length < 32 || !/^freellmapi-[a-f0-9]{64}$/.test(key)) {
+          console.error('[hive-smoke] FAIL missing/invalid configured secrets');
+          return;
+        }
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 60000);
+        try {
+          const response = await fetch(`http://127.0.0.1:${PORT}/v1/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-hive-token': hive,
+              authorization: `Bearer ${key}`,
+            },
+            body: JSON.stringify({
+              model: 'openai/gpt-oss-120b',
+              messages: [{ role: 'user', content: 'Respond with the single word OK.' }],
+              stream: false,
+              max_tokens: 24,
+            }),
+            signal: controller.signal,
+          });
+          const result: unknown = await response.json();
+          const valid = response.ok &&
+            !!result && typeof result === 'object' &&
+            Array.isArray((result as {choices?: unknown}).choices) &&
+            (result as {choices: unknown[]}).choices.length > 0;
+          console.log(`[hive-smoke] ${valid ? 'PASS' : 'FAIL'} status=${response.status} completion=${valid ? 'present' : 'absent'}`);
+        } catch (err) {
+          console.error(`[hive-smoke] FAIL transport=${err instanceof Error ? err.name : 'unknown'}`);
+        } finally {
+          clearTimeout(timeout);
+        }
+      })();
+    }
+
 
     // Post-sleep recovery: while the host was suspended (laptop lid, VM
     // pause) timers and keep-alive sockets froze, so the first requests after
