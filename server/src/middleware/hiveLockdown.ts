@@ -12,5 +12,14 @@ export function hiveLockdown(req: Request, res: Response, next: NextFunction): v
   const actual = crypto.createHash('sha256').update(req.headers.authorization || '').digest();
   const expected = crypto.createHash('sha256').update('Bearer ' + token).digest();
   if (!crypto.timingSafeEqual(actual, expected)) { res.status(401).json({ code: 'UNAUTHORIZED' }); return; }
+  // Permit inference only behind BOTH the Hive bearer and the proxy's
+  // separate unified/profile API key. Dashboard/admin routes remain closed.
+  const inferenceRoute =
+    (req.method === 'POST' && req.path === '/v1/chat/completions') ||
+    (req.method === 'GET' && req.path === '/v1/models');
+  if (inferenceRoute && process.env.FREEAPI_HIVE_INFERENCE_ENABLED === 'true') {
+    next();
+    return;
+  }
   res.status(503).json({ code: 'HIVE_INFERENCE_NOT_ENABLED' });
 }
