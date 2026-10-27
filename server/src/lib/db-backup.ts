@@ -283,7 +283,7 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
       const detail = await res.text().catch(() => '');
       const trimmed = detail.slice(0, 500);
       // Non-strict: no current backup version to CAS against (first backup) -> skip gracefully.
-      if (!strictRemote() && (res.status === 412 || res.status === 428) && detail.includes('STALE_BACKUP' || 'IF_MATCH_REQUIRED')) {
+      if (!strictRemote() && (res.status === 412 || res.status === 428) && (detail.includes('STALE_BACKUP') || detail.includes('IF_MATCH_REQUIRED'))) {
         console.warn(`[db-backup] no current backup version for CAS; skipping upload (${res.status})`);
         return;
       }
