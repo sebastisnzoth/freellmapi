@@ -18,6 +18,11 @@ const remoteVersions = new Map<string, string>();
 const activeBackups = new Set<string>();
 const strictRemote = () => process.env.FREEAPI_DB_BACKUP_STRICT === 'true';
 
+// Retry configuration
+const MAX_UPLOAD_RETRIES = 1;
+const CAS_VERSION_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
+const casVersionCache = new Map<string, { version: string; expiresAt: number }>();
+
 const versionKey = (target: string, dbPath: string) => target + '\0' + path.resolve(dbPath);
 const versionPath = (dbPath: string) => dbPath + '.backup-version.json';
 function rememberVersion(target: string, dbPath: string, etag: string) {
@@ -49,6 +54,78 @@ function checkRemote(target: string) {
       !process.env.FREEAPI_DB_BACKUP_TOKEN?.trim())) {
     throw new Error('strict backup requires HTTPS, bearer token and a URL without credentials/query/fragment');
   }
+}
+
+/**
+ * Extract Supabase project URL and table from backup target URL.
+ * Expected: https://<project>.supabase.co/functions/v1/ugo-hive-backup-receiver
+ * Returns base URL for REST API: https://<project>.supabase.co/rest/v1/
+ */
+function getSupabaseRestBase(target: string): string | null {
+  try {
+    const url = new URL(target);
+    if (url.hostname.endsWith('.supabase.co')) {
+      return `https://${url.hostname}/rest/v1/`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch current CAS version from Supabase REST API directly (bypasses receiver 409).
+ * Queries hive_backup_versions table ordered by sequence desc, limit 1.
+ */
+async function getCurrentCasVersion(target: string, token: string): Promise<string | null> {
+  const cacheKey = target;
+  const cached = casVersionCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.version;
+  }
+
+  const restBase = getSupabaseRestBase(target);
+  if (!restBase) return null;
+
+  try {
+    const url = `${restBase}hive_backup_versions?select=version&order=sequence.desc&limit=1`;
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'apikey': token,
+        'Accept': 'application/json',
+        'Prefer': 'count=exact',
+      },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+
+    if (!res.ok) {
+      console.warn(`[db-backup] Failed to fetch CAS version: HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const version = data[0]?.version;
+    if (version && /^[0-9a-f-]{36}$/i.test(version)) {
+      casVersionCache.set(cacheKey, { version, expiresAt: Date.now() + CAS_VERSION_CACHE_TTL_MS });
+      return version;
+    }
+    return null;
+  } catch (err) {
+    console.warn(`[db-backup] Error fetching CAS version: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
+/**
+ * Validate ETag format (must be quoted UUID).
+ */
+function validateETag(etag: string | null): string | null {
+  if (!etag) return null;
+  const match = etag.match(/^"([0-9a-f-]{36})"$/i);
+  return match ? match[1] : null;
 }
 
 async function boundedBody(res: Response): Promise<Buffer> {
@@ -249,7 +326,7 @@ async function readTarget(target: string, dbPath: string): Promise<Buffer | null
   return fs.readFileSync(target);
 }
 
-async function writeTarget(target: string, payload: Buffer, dbPath: string): Promise<{ uploaded: boolean; etag?: string }> {
+async function writeTarget(target: string, payload: Buffer, dbPath: string): Promise<{ uploaded: boolean; etag?: string; retried: boolean }> {
   if (payload.length > MAX_BACKUP_BYTES) throw new Error('backup exceeds size limit');
   if (isHttpTarget(target)) {
     checkRemote(target);
@@ -260,51 +337,104 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
       // 401 on a schedule and only ever be noticed as an empty restore.
       if (!token) throw new Error('FREEAPI_DB_BACKUP_TOKEN is required to upload a backup to Hugging Face');
       await uploadToHuggingFace(huggingFace.commitUrl, huggingFace.filePath, payload, token);
-      return { uploaded: true };
+      return { uploaded: true, retried: false };
     }
 
     const headers: Record<string, string> = { 'Content-Type': 'application/octet-stream' };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const acknowledged = acknowledgedVersion(target, dbPath);
-    if (acknowledged) headers['If-Match'] = acknowledged;
-    if (strictRemote()) {
-      const version = acknowledged;
-      if (!version) throw new Error('restore current snapshot before uploading in strict mode');
-      headers['If-Match'] = version;
+    
+    // Obtain current CAS version for If-Match header
+    let ifMatchVersion = acknowledgedVersion(target, dbPath);
+    if (!ifMatchVersion) {
+      // No local version cached: fetch current version from Supabase REST API directly
+      ifMatchVersion = await getCurrentCasVersion(target, token);
     }
-    const res = await fetch(target, {
-      method: 'PUT',
-      redirect: 'error',
-      headers,
-      body: payload,
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (!res.ok) {
+    if (ifMatchVersion) {
+      headers['If-Match'] = `"${ifMatchVersion}"`;
+    }
+    
+    if (strictRemote()) {
+      if (!ifMatchVersion) throw new Error('strict backup requires known CAS version for upload');
+    }
+    
+    // Retry logic: max 1 retry on 409/412/428
+    let retried = false;
+    for (let attempt = 0; attempt <= MAX_UPLOAD_RETRIES; attempt++) {
+      const res = await fetch(target, {
+        method: 'PUT',
+        redirect: 'error',
+        headers,
+        body: payload,
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+
+      if (res.ok) {
+        const etag = res.headers.get('etag');
+        const validEtag = validateETag(etag);
+        if (strictRemote() && !validEtag) throw new Error('backup upload ETag required');
+        if (validEtag) {
+          rememberVersion(target, dbPath, `"${validEtag}"`);
+          ifMatchVersion = validEtag; // Update local cache
+        }
+        return { uploaded: true, etag: validEtag ? `"${validEtag}"` : undefined, retried };
+      }
+
       const detail = await res.text().catch(() => '');
       const trimmed = detail.slice(0, 500);
-      // Non-strict: no current backup version to CAS against (first backup) -> skip gracefully.
-      if (!strictRemote() && (res.status === 412 || res.status === 428) && (detail.includes('STALE_BACKUP') || detail.includes('IF_MATCH_REQUIRED'))) {
-        console.warn(`[db-backup] no current backup version for CAS; skipping upload (${res.status})`);
-        return { uploaded: false };
+
+      // Non-strict: handle specific error codes with retry
+      if (!strictRemote()) {
+        // 409 FRESHNESS_REVIEW: backup stale, fetch current version and retry once
+        if (res.status === 409 && detail.includes('BACKUP_REQUIRES_FRESHNESS_REVIEW') && attempt < MAX_UPLOAD_RETRIES) {
+          console.warn(`[db-backup] Backup stale (409), fetching current CAS version for retry`);
+          const freshVersion = await getCurrentCasVersion(target, token);
+          if (freshVersion) {
+            headers['If-Match'] = `"${freshVersion}"`;
+            retried = true;
+            continue;
+          }
+        }
+        // 412 STALE_BACKUP: version mismatch, fetch current and retry once
+        if (res.status === 412 && detail.includes('STALE_BACKUP') && attempt < MAX_UPLOAD_RETRIES) {
+          console.warn(`[db-backup] CAS version mismatch (412), fetching current CAS version for retry`);
+          const freshVersion = await getCurrentCasVersion(target, token);
+          if (freshVersion) {
+            headers['If-Match'] = `"${freshVersion}"`;
+            retried = true;
+            continue;
+          }
+        }
+        // 428 IF_MATCH_REQUIRED: missing If-Match, fetch current and retry once
+        if (res.status === 428 && detail.includes('IF_MATCH_REQUIRED') && attempt < MAX_UPLOAD_RETRIES) {
+          console.warn(`[db-backup] Missing If-Match (428), fetching current CAS version for retry`);
+          const freshVersion = await getCurrentCasVersion(target, token);
+          if (freshVersion) {
+            headers['If-Match'] = `"${freshVersion}"`;
+            retried = true;
+            continue;
+          }
+        }
+        // 412/428 with no current version (first backup) -> skip gracefully
+        if ((res.status === 412 || res.status === 428) && 
+            (detail.includes('STALE_BACKUP') || detail.includes('IF_MATCH_REQUIRED'))) {
+          console.warn(`[db-backup] no current backup version for CAS; skipping upload (${res.status})`);
+          return { uploaded: false, retried };
+        }
       }
+
       throw new Error(`backup upload failed: HTTP ${res.status}${trimmed ? ` — ${trimmed}` : ''}`);
     }
-    const etag = res.headers.get('etag');
-    if (strictRemote() && !/^"[0-9a-f-]{36}"$/.test(etag || '')) throw new Error('backup upload ETag required');
-    if (etag) rememberVersion(target, dbPath, etag);
-    return { uploaded: true, etag };
+
+    throw new Error('backup upload failed: max retries exceeded');
   }
 
+  // Local file path (non-HTTP target)
   fs.mkdirSync(path.dirname(path.resolve(target)), { recursive: true });
-  // Encrypted, but not therefore safe to leave world-readable: the key is
-  // FREEAPI_DB_BACKUP_KEY or ENCRYPTION_KEY, which on a normal install sits in a
-  // .env file on the same host. The mode covers creation; restrictToOwner covers
-  // the overwrite case, where an existing file keeps the mode it already had —
-  // and covers Windows, where the mode argument is a no-op.
   fs.writeFileSync(target, payload, { mode: 0o600 });
   if (!restrictToOwner(target)) {
     console.warn(`[db-backup] could not restrict permissions on ${target} — it may be readable by other local accounts`);
   }
+  return { uploaded: true, retried: false };
 }
 
 export async function restoreDbBackupIfNeeded(dbPath = getDefaultDbPath()): Promise<DbBackupResult> {
@@ -375,11 +505,11 @@ export async function backupDbNow(db: Db, dbPath = getDefaultDbPath()): Promise<
     if (plain.length > MAX_DATABASE_BYTES) throw new Error('database exceeds backup size limit');
     const result = await writeTarget(target, encryptBackup(gzipSync(plain)), dbPath);
     if (result?.uploaded) {
-      console.log(`[db-backup] uploaded ${plain.length} bytes`);
+      console.log(`[db-backup] uploaded ${plain.length} bytes${result.retried ? ' (retried)' : ''}`);
       return { ok: true, target, bytes: plain.length };
     }
     // writeTarget returned without uploading (CAS skip in non-strict mode)
-    return { ok: true, target, skipped: 'cas_mismatch_no_current_version' };
+    return { ok: true, target, skipped: result?.retried ? 'cas_mismatch_after_retry' : 'cas_mismatch_no_current_version' };
   } finally {
     activeBackups.delete(target);
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
