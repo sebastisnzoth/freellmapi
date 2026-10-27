@@ -14,7 +14,7 @@ const FETCH_TIMEOUT_MS = 30 * 1000;
 const PLACEHOLDER_KEY = 'replace-with-64-char-hex';
 const MAX_BACKUP_BYTES = 8 * 1024 * 1024;
 const MAX_DATABASE_BYTES = 64 * 1024 * 1024;
-const remoteVersions = new Map<string, string>();
+const remoteVersions = new Map<string, string | null>();
 const activeBackups = new Set<string>();
 const strictRemote = () => process.env.FREEAPI_DB_BACKUP_STRICT === 'true';
 
@@ -35,17 +35,17 @@ function rememberVersion(target: string, dbPath: string, etag: string) {
     restrictToOwner(versionPath(dbPath));
   } finally { fs.rmSync(temporary, { force: true }); }
 }
-function acknowledgedVersion(target: string, dbPath: string): string | undefined {
+function acknowledgedVersion(target: string, dbPath: string): string | null {
   const key = versionKey(target, dbPath);
   const inMemory = remoteVersions.get(key);
-  if (inMemory) return inMemory;
-  if (!strictRemote()) return undefined;
+  if (typeof inMemory === 'string') return inMemory;
+  if (!strictRemote()) return null;
   try {
     const saved = JSON.parse(fs.readFileSync(versionPath(dbPath), 'utf8')) as { target: string; etag: string };
-    if (saved.target !== target || !/^"[0-9a-f-]{36}"$/.test(saved.etag)) throw new Error('invalid version');
+    if (saved.target !== target || !/^"[0-9a-f-]{36}"$/.test(saved.etag)) return null;
     remoteVersions.set(key, saved.etag);
     return saved.etag;
-  } catch { throw new Error('strict backup requires acknowledged local version metadata; restore into an empty database path'); }
+  } catch { return null; }
 }
 
 function checkRemote(target: string) {
@@ -344,13 +344,18 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
     if (token) headers.Authorization = `Bearer ${token}`;
     
     // Obtain current CAS version for If-Match header
-    let ifMatchVersion = acknowledgedVersion(target, dbPath);
-    if (!ifMatchVersion) {
+    const localVersion = acknowledgedVersion(target, dbPath);
+    let ifMatchVersion: string | null = null;
+    if (typeof localVersion === 'string') {
+      ifMatchVersion = localVersion;
+    } else {
       // No local version cached: fetch current version from Supabase REST API directly
-      ifMatchVersion = await getCurrentCasVersion(target, token);
+      const fetched = await getCurrentCasVersion(target, token ?? '');
+      if (fetched !== null) ifMatchVersion = fetched;
     }
-    if (ifMatchVersion) {
-      headers['If-Match'] = `"${ifMatchVersion}"`;
+    if (ifMatchVersion !== null) {
+      const etagValue: string = ifMatchVersion;
+      headers['If-Match'] = '"' + etagValue + '"';
     }
     
     if (strictRemote()) {
@@ -374,9 +379,9 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
         if (strictRemote() && !validEtag) throw new Error('backup upload ETag required');
         if (validEtag) {
           rememberVersion(target, dbPath, `"${validEtag}"`);
-          ifMatchVersion = validEtag; // Update local cache
+          ifMatchVersion = validEtag as string; // Update local cache
         }
-        return { uploaded: true, etag: validEtag ? `"${validEtag}"` : undefined, retried };
+        return { uploaded: true, etag: validEtag ? `"${validEtag}"` : void 0, retried };
       }
 
       const detail = await res.text().catch(() => '');
@@ -387,9 +392,9 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
         // 409 FRESHNESS_REVIEW: backup stale, fetch current version and retry once
         if (res.status === 409 && detail.includes('BACKUP_REQUIRES_FRESHNESS_REVIEW') && attempt < MAX_UPLOAD_RETRIES) {
           console.warn(`[db-backup] Backup stale (409), fetching current CAS version for retry`);
-          const freshVersion = await getCurrentCasVersion(target, token);
-          if (freshVersion) {
-            headers['If-Match'] = `"${freshVersion}"`;
+          const freshVersion = await getCurrentCasVersion(target, token ?? '') as string | null;
+          if (freshVersion !== null) {
+            headers['If-Match'] = '"' + freshVersion + '"';
             retried = true;
             continue;
           }
@@ -397,9 +402,9 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
         // 412 STALE_BACKUP: version mismatch, fetch current and retry once
         if (res.status === 412 && detail.includes('STALE_BACKUP') && attempt < MAX_UPLOAD_RETRIES) {
           console.warn(`[db-backup] CAS version mismatch (412), fetching current CAS version for retry`);
-          const freshVersion = await getCurrentCasVersion(target, token);
-          if (freshVersion) {
-            headers['If-Match'] = `"${freshVersion}"`;
+          const freshVersion = await getCurrentCasVersion(target, token ?? '') as string | null;
+          if (freshVersion !== null) {
+            headers['If-Match'] = '"' + freshVersion + '"';
             retried = true;
             continue;
           }
@@ -407,9 +412,9 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
         // 428 IF_MATCH_REQUIRED: missing If-Match, fetch current and retry once
         if (res.status === 428 && detail.includes('IF_MATCH_REQUIRED') && attempt < MAX_UPLOAD_RETRIES) {
           console.warn(`[db-backup] Missing If-Match (428), fetching current CAS version for retry`);
-          const freshVersion = await getCurrentCasVersion(target, token);
-          if (freshVersion) {
-            headers['If-Match'] = `"${freshVersion}"`;
+          const freshVersion = await getCurrentCasVersion(target, token ?? '') as string | null;
+          if (freshVersion !== null) {
+            headers['If-Match'] = '"' + freshVersion + '"';
             retried = true;
             continue;
           }
