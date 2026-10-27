@@ -249,7 +249,7 @@ async function readTarget(target: string, dbPath: string): Promise<Buffer | null
   return fs.readFileSync(target);
 }
 
-async function writeTarget(target: string, payload: Buffer, dbPath: string): Promise<void> {
+async function writeTarget(target: string, payload: Buffer, dbPath: string): Promise<{ uploaded: boolean; etag?: string }> {
   if (payload.length > MAX_BACKUP_BYTES) throw new Error('backup exceeds size limit');
   if (isHttpTarget(target)) {
     checkRemote(target);
@@ -285,14 +285,14 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
       // Non-strict: no current backup version to CAS against (first backup) -> skip gracefully.
       if (!strictRemote() && (res.status === 412 || res.status === 428) && (detail.includes('STALE_BACKUP') || detail.includes('IF_MATCH_REQUIRED'))) {
         console.warn(`[db-backup] no current backup version for CAS; skipping upload (${res.status})`);
-        return;
+        return { uploaded: false };
       }
       throw new Error(`backup upload failed: HTTP ${res.status}${trimmed ? ` — ${trimmed}` : ''}`);
     }
     const etag = res.headers.get('etag');
     if (strictRemote() && !/^"[0-9a-f-]{36}"$/.test(etag || '')) throw new Error('backup upload ETag required');
     if (etag) rememberVersion(target, dbPath, etag);
-    return;
+    return { uploaded: true, etag };
   }
 
   fs.mkdirSync(path.dirname(path.resolve(target)), { recursive: true });
@@ -373,9 +373,13 @@ export async function backupDbNow(db: Db, dbPath = getDefaultDbPath()): Promise<
     db.prepare('VACUUM INTO ?').run(snapshot);
     const plain = fs.readFileSync(snapshot);
     if (plain.length > MAX_DATABASE_BYTES) throw new Error('database exceeds backup size limit');
-    await writeTarget(target, encryptBackup(gzipSync(plain)), dbPath);
-    console.log(`[db-backup] uploaded ${plain.length} bytes`);
-    return { ok: true, target, bytes: plain.length };
+    const result = await writeTarget(target, encryptBackup(gzipSync(plain)), dbPath);
+    if (result?.uploaded) {
+      console.log(`[db-backup] uploaded ${plain.length} bytes`);
+      return { ok: true, target, bytes: plain.length };
+    }
+    // writeTarget returned without uploading (CAS skip in non-strict mode)
+    return { ok: true, target, skipped: 'cas_mismatch_no_current_version' };
   } finally {
     activeBackups.delete(target);
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
