@@ -228,6 +228,11 @@ async function readTarget(target: string, dbPath: string): Promise<Buffer | null
       if (strictRemote()) throw new Error('strict backup requires an existing provisioned snapshot');
       return null;
     }
+    // Non-strict mode: treat stale backup (409) as 'skip' — same as missing backup.
+    if (!strictRemote() && res.status === 409) {
+      const detail = await res.text().catch(() => '');
+      if (detail.includes('BACKUP_REQUIRES_FRESHNESS_REVIEW')) return null;
+    }
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
       const trimmed = detail.slice(0, 500);
