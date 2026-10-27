@@ -260,7 +260,7 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
       // 401 on a schedule and only ever be noticed as an empty restore.
       if (!token) throw new Error('FREEAPI_DB_BACKUP_TOKEN is required to upload a backup to Hugging Face');
       await uploadToHuggingFace(huggingFace.commitUrl, huggingFace.filePath, payload, token);
-      return;
+      return { uploaded: true };
     }
 
     const headers: Record<string, string> = { 'Content-Type': 'application/octet-stream' };
