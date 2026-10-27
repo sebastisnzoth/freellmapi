@@ -39,13 +39,26 @@ async function main() {
 
   const scheduler = new NodeScheduler();
 
-  if (config.dbPath) {
-    await restoreDbBackupIfNeeded(config.dbPath);
-  } else {
-    await restoreDbBackupIfNeeded();
+  // Distinguish a remote backup stall from a SQLite/init failure.
+  // Never log backup URLs, paths, tokens, keys, or restored contents.
+  console.info('[startup] backup_restore begin');
+  try {
+    if (config.dbPath) {
+      await restoreDbBackupIfNeeded(config.dbPath);
+    } else {
+      await restoreDbBackupIfNeeded();
+    }
+  } catch (error) {
+    console.error('[startup] backup_restore FAILED; refusing to start with an unverified database');
+    throw error;
   }
+  console.info('[startup] backup_restore complete');
+  console.info('[startup] sqlite_init begin');
   initDb(config.dbPath ?? undefined);
+  console.info('[startup] sqlite_init complete');
+  console.info('[startup] declarative_config begin');
   applyDeclarativeConfigFromEnv();
+  console.info('[startup] declarative_config complete');
   // After initDb: the unknown-model half of this check reads the catalog.
   warnOnRoutingOverrideDrift();
 

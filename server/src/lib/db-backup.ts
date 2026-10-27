@@ -203,7 +203,8 @@ async function uploadToHuggingFace(
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
-    throw new Error(`backup upload failed: HF commit HTTP ${res.status}${detail ? ` — ${detail.slice(0, 200)}` : ''}`);
+    const trimmed = detail.slice(0, 500);
+    throw new Error(`backup upload failed: HF commit HTTP ${res.status}${trimmed ? ` — ${trimmed}` : ''}`);
   }
 }
 
@@ -227,7 +228,11 @@ async function readTarget(target: string, dbPath: string): Promise<Buffer | null
       if (strictRemote()) throw new Error('strict backup requires an existing provisioned snapshot');
       return null;
     }
-    if (!res.ok) throw new Error(`backup restore failed: HTTP ${res.status}`);
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      const trimmed = detail.slice(0, 500);
+      throw new Error(`backup restore failed: HTTP ${res.status}${trimmed ? ` — ${trimmed}` : ''}`);
+    }
     const raw = await boundedBody(res);
     const etag = res.headers.get('etag');
     if (strictRemote() && !/^"[0-9a-f-]{36}"$/.test(etag || '')) throw new Error('backup ETag required');
@@ -269,7 +274,11 @@ async function writeTarget(target: string, payload: Buffer, dbPath: string): Pro
       body: payload,
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
-    if (!res.ok) throw new Error(`backup upload failed: HTTP ${res.status}`);
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      const trimmed = detail.slice(0, 500);
+      throw new Error(`backup upload failed: HTTP ${res.status}${trimmed ? ` — ${trimmed}` : ''}`);
+    }
     const etag = res.headers.get('etag');
     if (strictRemote() && !/^"[0-9a-f-]{36}"$/.test(etag || '')) throw new Error('backup upload ETag required');
     if (etag) rememberVersion(target, dbPath, etag);
