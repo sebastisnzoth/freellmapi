@@ -84,24 +84,17 @@ async function getCurrentCasVersion(target: string, token: string): Promise<stri
     return cached.version;
   }
 
-  const restBase = getSupabaseRestBase(target);
-  if (!restBase) return null;
-
   try {
-    const url = `${restBase}hive_backup_versions?select=version&order=sequence.desc&limit=1`;
-    const res = await fetch(url, {
+    const res = await fetch(target, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${token}`,
-        'apikey': token,
-        'Accept': 'application/json',
-        'Prefer': 'count=exact',
       },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!res.ok) {
-      console.warn(`[db-backup] Failed to fetch CAS version: HTTP ${res.status}`);
+      console.warn(`[db-backup] Failed to fetch CAS version from receiver: HTTP ${res.status}`);
       return null;
     }
 
@@ -114,7 +107,7 @@ async function getCurrentCasVersion(target: string, token: string): Promise<stri
     }
     return null;
   } catch (err) {
-    console.warn(`[db-backup] Error fetching CAS version: ${err instanceof Error ? err.message : err}`);
+    console.warn(`[db-backup] Error fetching CAS version from receiver: ${err instanceof Error ? err.message : err}`);
     return null;
   }
 }
